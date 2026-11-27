@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from math import isfinite
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
@@ -17,6 +18,18 @@ from .manual import DEFAULT_SECONDS, ROLES, output_conflicts, output_row, source
 
 LEVEL_SENSOR = "level_sensor"
 ENTITY_FIELDS = {LEVEL_SENSOR: "sensor", "refill_switch": "switch", "alarm_switch": "switch"}
+
+
+class _ThresholdNumberSelector(NumberSelector):
+    """Expose the native numeric box without accepting boolean coercion."""
+
+    def __call__(self, data: object) -> float:
+        if isinstance(data, bool):
+            raise vol.Invalid("Expected a number")
+        try:
+            return super().__call__(data)
+        except OverflowError as err:
+            raise vol.Invalid("Number is out of range") from err
 
 
 def _text_field(field: str, values: dict) -> dict:
@@ -137,7 +150,9 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         self._require_fresh()
         return self.async_show_menu(
             step_id="init",
-            menu_options=["add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank"],
+            menu_options=[
+                "add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank", "edit_thresholds",
+            ],
         )
 
     async def async_step_add_zone(self, user_input: dict | None = None) -> ConfigFlowResult:
@@ -158,6 +173,9 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
 
     async def async_step_remove_tank(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self._choose("remove_tank")
+
+    async def async_step_edit_thresholds(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return self._choose("edit_thresholds")
 
     def _require_fresh(self) -> ConfigEntry:
         entry = self.hass.config_entries.async_get_entry(self.handler)
@@ -180,7 +198,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             tank["id"] == manual["tank_id"] for zone in self._zones for tank in zone["tanks"]
         ):
             self._manual_delta = {"manual": {}}
-        if entry.disabled_by and self._operation in ("remove_zone", "remove_tank"):
+        if entry.disabled_by and self._operation in ("remove_zone", "remove_tank", "edit_thresholds"):
             # Disabled entries do not set up on reload. Read only the committed
             # native options on the next loop turn, never this private draft.
             self.hass.loop.call_soon(async_prune_disabled_levels, self.hass, entry)
@@ -195,7 +213,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
 
     def _target_form(self, user_input: dict | None) -> ConfigFlowResult:
         self._require_fresh()
-        tank_target = self._operation in ("edit_tank", "remove_tank")
+        tank_target = self._operation in ("edit_tank", "remove_tank", "edit_thresholds")
         field = "tank_id" if tank_target else "zone_id"
         targets = {}
         registry = er.async_get(self.hass)
@@ -223,6 +241,8 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             return self._zone_form("rename_zone", None)
         if self._operation in ("add_tank", "edit_tank"):
             return self._tank_form(None)
+        if self._operation == "edit_thresholds":
+            return self._threshold_form(None)
         if self._operation == "remove_zone" and len(self._zones) == 1:
             return self.async_abort(reason="minimum_zones")
         if self._operation == "remove_tank" and len(self._zone["tanks"]) == 1:
@@ -282,7 +302,10 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             if index is None:
                 self._zone["tanks"].append(new_tank(registry, user_input))
             else:
-                self._zone["tanks"][index] = new_tank(registry, user_input, tank["id"])
+                edited = new_tank(registry, user_input, tank["id"])
+                if "thresholds" in tank:
+                    edited["thresholds"] = tank["thresholds"]
+                self._zone["tanks"][index] = edited
             return self._commit()
         # Any rejected submission, including cutoff confirmation, can echo a
         # newly selected entity. Capture identities only once rendering is known.
@@ -358,6 +381,45 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
                 "max_runtime_seconds": int(seconds),
             }
         return {"manual": settings}, {}
+
+    async def async_step_save_thresholds(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return self._threshold_form(user_input)
+
+    def _threshold_form(self, user_input: dict | None) -> ConfigFlowResult:
+        self._require_fresh()
+        assert self._tank_index is not None
+        tank = self._zone["tanks"][self._tank_index]
+        lower, upper = "refill_lower_m", "refill_upper_m"
+        alarm, delay = "alarm_lower_m", "alarm_delay_seconds"
+        values = tank.get("thresholds", {}) if user_input is None else user_input
+        errors = {field: "finite_threshold_required" for field, value in values.items() if not isfinite(value)}
+        for first, second in ((lower, upper), (alarm, delay)):
+            if (first in values) != (second in values):
+                errors[second if first in values else first] = "threshold_pair_required"
+        if (
+            lower in values and upper in values and lower not in errors and upper not in errors
+            and values[lower] >= values[upper]
+        ):
+            errors[upper] = "threshold_order"
+        if delay in values and delay not in errors and (values[delay] < 1 or not float(values[delay]).is_integer()):
+            errors[delay] = "positive_whole_delay"
+        if user_input is not None and not errors:
+            if values:
+                tank["thresholds"] = dict(values)
+            else:
+                tank.pop("thresholds", None)
+            return self._commit()
+        fields = {}
+        for field, step, unit in ((lower, "any", "m"), (upper, "any", "m"), (alarm, "any", "m"), (delay, 1, "s")):
+            value = values.get(field)
+            suggestion = value if value is not None and isfinite(value) else None
+            fields[vol.Optional(field, description={"suggested_value": suggestion})] = _ThresholdNumberSelector(
+                {"step": step, "mode": "box", "unit_of_measurement": unit}
+            )
+        return self.async_show_form(
+            step_id="save_thresholds", data_schema=vol.Schema(fields), errors=errors,
+            description_placeholders={"target": self._target_label},
+        )
 
     async def async_step_confirm_remove(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self._confirm_remove(user_input)

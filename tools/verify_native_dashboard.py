@@ -15,7 +15,10 @@ import logging
 import os
 import shutil
 import socket
+import sys
 from tempfile import TemporaryDirectory
+from time import monotonic
+from unittest.mock import patch
 
 # HA's bootstrap imports LiteLLM indirectly; skip its optional remote price map.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
@@ -23,7 +26,7 @@ os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 from homeassistant import bootstrap, loader
 from homeassistant.auth.const import GROUP_ID_ADMIN
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceRegistry
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from playwright.async_api import async_playwright, expect
@@ -34,6 +37,7 @@ TITLE = "水量總覽驗證"
 CARD_TAG = "uninus-water-dashboard"
 URL_PATH = "/uninus_water_control/dashboard.js"
 MANUAL = "uninus_water_manual"
+PREVIEW = "uninus_water_thresholds"
 OUTPUTS = {role: f"switch.browser_{role}" for role in ("refill", "alarm")}
 
 
@@ -254,6 +258,188 @@ async def verify_manual(page, shell, hass, entry, outputs, calls, screenshot_dir
     print("PASS: native Options commissioning readback; bundled HA Start/Stop/Reset clicks; exact button.press targets; independent synthetic feedback and alarm stop during held ON; no other tank controls")
 
 
+async def verify_threshold_previews(page, options, shell, hass, entry, outputs, calls, base_url, screenshot_dir):
+    """Only browser Options writes configuration; preview interactions only open native More info."""
+    fields = {
+        "Refill lower threshold": "1.25", "Stop upper threshold": "1.85",
+        "Low-level alarm threshold": "1.2", "Continuous low-level alarm delay": "4",
+    }
+    expected_settings = dict(zip(
+        ("refill_lower_m", "refill_upper_m", "alarm_lower_m", "alarm_delay_seconds"),
+        (1.25, 1.85, 1.2, 4), strict=True,
+    ))
+    zone = entry.options["zones"][0]
+    tank_id = zone["tanks"][0]["id"]
+    manual_before = entry.options["manual"]
+    tank = shell.locator(f'[data-tank-id="{tank_id}"]')
+    refill = tank.locator('hui-tile-card[data-preview-kind="refill_preview"]')
+    alarm = tank.locator('hui-tile-card[data-preview-kind="low_level_alarm"]')
+    threshold_dialog = options.get_by_role("alertdialog", name="Read-only threshold previews", exact=True)
+    await expect(shell.locator("[data-preview-kind]")).to_have_count(0)
+    core_calls = []
+
+    original_call = ServiceRegistry.async_call
+
+    async def record_service(registry, domain, service, *args, **kwargs):
+        # Observe attempts before schema and lookup so even an absent notifier counts.
+        if registry is hass.services and domain.lower() in {"switch", "notify", "persistent_notification"}:
+            core_calls.append((domain, service))
+        return await original_call(registry, domain, service, *args, **kwargs)
+
+    observer = patch.object(ServiceRegistry, "async_call", record_service)
+    browser_call_count = len(calls)
+
+    async def open_form():
+        # Activate the actual button; its slotted icon can intercept pointer hit-testing.
+        await options.get_by_role("button", name="Configure", exact=True).press("Enter")
+        await options.get_by_text("Edit threshold previews", exact=True).click()
+        picker = options.locator("ha-selector-select").get_by_role("combobox")
+        await picker.click()
+        await options.get_by_role("option", name="1.1 · 育苗區 / 一號水桶 · sensor.test_depth_1", exact=True).click()
+        await options.get_by_role("button", name="Submit", exact=True).click()
+        await expect(threshold_dialog).to_be_visible()
+        await expect(options.get_by_role("spinbutton")).to_have_count(len(fields))
+
+    source = "sensor.test_depth_1"
+
+    async def refill_state(value, label):
+        await expect(refill.get_by_text(label, exact=True)).to_be_visible()
+        assert hass.states.get(native["refill_preview"]).state == value
+
+    async def assert_preview_labels_fit():
+        for tile in (refill, alarm):
+            sizes = await tile.locator("ha-tile-info span").evaluate_all(
+                "els => els.filter(n => n.textContent.trim()).map(n => [n.textContent, n.clientWidth, n.scrollWidth])"
+            )
+            assert len(sizes) == 2 and all(0 < width and text_width <= width + 1
+                                           for _, width, text_width in sizes), sizes
+
+    async def alarm_state(value, label):
+        await expect(alarm.get_by_text({"Off": "OK", "On": "Problem"}.get(label, label), exact=True)).to_be_visible()
+        assert hass.states.get(native["low_level_alarm"]).state == value
+        await expect(tank.locator('[data-manual-role="alarm"]').get_by_text("HA feedback: Off", exact=True)).to_be_visible()
+        assert hass.states.get(OUTPUTS["alarm"]).state == "off"
+
+    observer.start()
+    try:
+        await options.goto(f"{base_url}/config/integrations/integration/{DOMAIN}", wait_until="domcontentloaded")
+        await open_form()
+        for label, value in fields.items():
+            field = options.get_by_role("spinbutton", name=label, exact=True)
+            await expect(field).to_have_value("")
+            await field.click()
+            await field.press_sequentially(value)
+            await expect(field).to_have_value(value)
+        if screenshot_dir is not None:
+            await options.screenshot(path=screenshot_dir / "native-p4-options-filled.png")
+        await options.get_by_role("button", name="Submit", exact=True).click()
+        await expect(threshold_dialog).not_to_be_visible()
+        await expect(options.get_by_text("Options successfully saved.", exact=True)).to_be_visible()
+        await options.get_by_role("button", name="Finish", exact=True).click()
+        await expect(options.get_by_role("alertdialog", name="Success", exact=True)).not_to_be_visible()
+
+        # Establish producer truth independently of the live dashboard projection.
+        await hass.async_block_till_done()
+        assert entry.state == ConfigEntryState.LOADED
+        assert entry.options["manual"] == manual_before
+        assert entry.options["zones"][0]["tanks"][0]["thresholds"] == expected_settings
+        assert all("thresholds" not in item for item in entry.options["zones"][0]["tanks"][1:])
+        native = {}
+        for kind, domain in (("refill_preview", "sensor"), ("low_level_alarm", "binary_sensor")):
+            entity = er.async_get(hass).async_get_entity_id(domain, DOMAIN, f"{tank_id}_{kind}")
+            assert entity and hass.states.get(entity).attributes[PREVIEW] == {
+                "version": 1, "zone_id": zone["id"], "tank_id": tank_id, "kind": kind,
+            }
+            native[kind] = entity
+        await expect(refill).to_be_visible()
+        await expect(alarm).to_be_visible()
+        await expect(shell.locator("[data-preview-kind]")).to_have_count(2)
+
+        # Start a fresh Options frontend, rather than inheriting the closing dialog's state.
+        await options.reload(wait_until="domcontentloaded")
+        await open_form()
+        for label, value in fields.items():
+            await expect(options.get_by_role("spinbutton", name=label, exact=True)).to_have_value(value)
+        if screenshot_dir is not None:
+            await options.screenshot(path=screenshot_dir / "native-p4-options-reopened.png")
+        assert not await options.evaluate("window.waterTestUncaught")
+        await options.close()
+
+        await refill_state("between_thresholds", "Between thresholds")
+        await expect(tank.get_by_text("Refill threshold preview", exact=True)).to_be_visible()
+        await expect(tank.get_by_text("Alarm preview", exact=True)).to_be_visible()
+        await expect(tank.get_by_text("Manual alarm", exact=True)).to_be_visible()
+        await alarm_state("off", "Off")
+        tile_before = await refill.element_handle()
+        icon = refill.locator("ha-tile-icon")
+        await icon.focus()
+        await expect(icon).to_be_focused()
+        for reading, label, state in (
+            ("1250.1", "Between thresholds", "between_thresholds"),
+            ("1250", "Refill threshold reached", "refill_threshold"),
+            ("1849.9", "Between thresholds", "between_thresholds"),
+            ("1850", "Stop threshold reached", "stop_threshold"),
+        ):
+            hass.states.async_set(source, reading, {"unit_of_measurement": "mm"})
+            await refill_state(state, label)
+            if reading == "1250" and screenshot_dir is not None:
+                await shell.screenshot(path=screenshot_dir / "native-p4-refill-boundary.png")
+            await assert_preview_labels_fit()
+            assert await refill.evaluate("(el, previous) => el === previous", tile_before)
+            await expect(icon).to_be_focused()
+
+        # At equality, the alarm is still OFF before the continuous delay.
+        start = monotonic()
+        hass.states.async_set(source, "120", {"unit_of_measurement": "cm"})
+        await refill_state("refill_threshold", "Refill threshold reached")
+        await alarm_state("off", "Off")
+        assert monotonic() - start < 4
+        await alarm_state("on", "On")
+        assert monotonic() - start >= 4
+        if screenshot_dir is not None:
+            await shell.screenshot(path=screenshot_dir / "native-p4-delayed-alarm.png")
+
+        await alarm.locator("ha-tile-icon").click()
+        details = page.locator("ha-more-info-dialog ha-dialog[open]")
+        await details.wait_for(state="attached")
+        if screenshot_dir is not None:
+            await page.screenshot(path=screenshot_dir / "native-p4-alarm-more-info.png")
+        await page.keyboard.press("Escape")
+        await details.wait_for(state="detached")
+        hass.states.async_set(source, "121", {"unit_of_measurement": "cm"})
+        await alarm_state("off", "Off")
+        hass.states.async_set(source, "unavailable")
+        await refill_state("unavailable", "Unavailable")
+        await alarm_state("unavailable", "Unavailable")
+        hass.states.async_set(source, "121", {"unit_of_measurement": "cm"})
+        await alarm_state("off", "Off")
+        await refill_state("refill_threshold", "Refill threshold reached")
+        for width in (260, 380, 740):
+            await shell.evaluate("(el, w) => { el.style.width = `${w}px`; }", width)
+            assert await tank.evaluate("""el => {
+                const tank = el.getBoundingClientRect();
+                return [...el.querySelectorAll('[data-preview-kind]')].every(tile => {
+                    const r = tile.getBoundingClientRect();
+                    return r.width > 0 && r.left >= tank.left && r.right <= tank.right;
+                });
+            }"""), width
+            await assert_preview_labels_fit()
+            if screenshot_dir is not None and width == 380:
+                await shell.screenshot(path=screenshot_dir / "native-p4-recovered-380.png")
+        await hass.async_block_till_done()
+        assert not core_calls and len(calls) == browser_call_count and outputs.calls.empty(), (
+            core_calls, calls[browser_call_count:],
+        )
+        print("PASS: browser Options select/type/save/reopen; live refill boundaries, delayed preview alarm, unavailable and recovery; retained Tile/focus; native More info; zero preview browser service, switch or notification calls")
+    except Exception:
+        if screenshot_dir is not None and not options.is_closed():
+            await options.screenshot(path=screenshot_dir / "native-p4-options-failure.png")
+            print(await options.locator("body").aria_snapshot())
+        raise
+    finally:
+        observer.stop()
+
+
 async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path | None, login_only: bool) -> None:
     async with async_playwright() as playwright:
         exe = os.environ.get("WATER_CHROMIUM_EXECUTABLE")
@@ -301,7 +487,10 @@ async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path 
                     title, path: 'water-test', type:'panel', cards:[{type:'custom:' + tag}]
                 }]}});
             }""", [TITLE, CARD_TAG])
-            await page.goto(base_url + "/lovelace/water-test", wait_until="domcontentloaded")
+            async with page.expect_response(base_url + URL_PATH) as served_module:
+                await page.goto(base_url + "/lovelace/water-test", wait_until="domcontentloaded")
+            served = await served_module.value
+            assert served.ok and await served.body() == (ROOT / "custom_components" / DOMAIN / "dashboard.js").read_bytes()
             shell = page.locator(CARD_TAG)
             tiles = shell.locator("hui-tile-card")
             headings = shell.locator("hui-heading-card")
@@ -341,6 +530,11 @@ async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path 
             assert set(groups for _, groups in geometry) >= {1, 2, 3, 4}, geometry
             await shell.evaluate("el => { el.style.width = '740px'; }")
             await verify_manual(page, shell, hass, entry, outputs, calls, screenshot_dir)
+            options = await context.new_page()
+            options.set_default_timeout(8000)
+            options.on("websocket", lambda ws: ws.on("framesent", record_frame))
+            options.on("pageerror", lambda error: errors.append(str(error)))
+            await verify_threshold_previews(page, options, shell, hass, entry, outputs, calls, base_url, screenshot_dir)
             rejections = await page.evaluate("window.waterTestUncaught")
             assert not errors and not rejections, (errors, rejections)
             print(f"PASS: native resource/dashboard WS readback, Heading, Tile, More info, live level and inventory change; same viewport grid {geometry}; external requests blocked={len(external_requests)}")
@@ -354,6 +548,9 @@ async def main(login_only: bool, screenshots: Path | None) -> None:
         loader.async_setup(hass)
         hass.config.skip_pip = True
         port = loopback_port()
+        # Keep the copied integration import first for the entire fixture lifecycle.
+        # A namespace package can otherwise recompute its paths after Core's preload.
+        sys.path.insert(0, str(root))
         auth_provider = {"type": "trusted_networks", "trusted_networks": ["127.0.0.1/32"], "allow_bypass_login": True}
         core_config = {"homeassistant": {"auth_providers": [auth_provider]},
                        "http": {"server_host": "127.0.0.1", "server_port": port},
@@ -369,6 +566,8 @@ async def main(login_only: bool, screenshots: Path | None) -> None:
                 for i in range(1, 7):
                     hass.states.async_set(f"sensor.test_depth_{i}", str(110 + 15 * i), {"unit_of_measurement": "cm"})
                 entry = await native_entry(hass)
+                module = sys.modules[f"custom_components.{DOMAIN}"]
+                assert Path(module.__file__).resolve() == root / "custom_components" / DOMAIN / "__init__.py"
                 for pos in range(2, 6):
                     await native_add_tank(hass, entry, pos)
             else:
@@ -378,7 +577,10 @@ async def main(login_only: bool, screenshots: Path | None) -> None:
         finally:
             if outputs:
                 outputs.alarm_on.set()
-            await hass.async_stop()
+            try:
+                await hass.async_stop()
+            finally:
+                sys.path.remove(str(root))
 
 
 if __name__ == "__main__":

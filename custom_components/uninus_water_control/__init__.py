@@ -10,7 +10,7 @@ from homeassistant.helpers import entity_registry as er
 from .inventory import DOMAIN, inventory
 from .manual import ACTIONS, ROLES, ManualController
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -36,8 +36,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 @callback
 def _async_prune_levels(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Remove registry records for deleted tanks, and only those we own."""
-    active_ids = {tank["id"] for zone in inventory(entry) for tank in zone["tanks"]}
+    """Remove only our registry records for projections no longer configured."""
+    tanks = [tank for zone in inventory(entry) for tank in zone["tanks"]]
+    active_ids = {tank["id"] for tank in tanks}
+    previews = {f"{tank['id']}_refill_preview" for tank in tanks if "refill_lower_m" in tank.get("thresholds", {})}
+    alarms = {f"{tank['id']}_low_level_alarm" for tank in tanks if "alarm_lower_m" in tank.get("thresholds", {})}
     manual = entry.options.get("manual") or {}
     tank_id = manual.get("tank_id")
     roles = [role for role in ROLES if tank_id in active_ids and manual.get(role)]
@@ -46,7 +49,8 @@ def _async_prune_levels(hass: HomeAssistant, entry: ConfigEntry) -> None:
     registry = er.async_get(hass)
     for row in er.async_entries_for_config_entry(registry, entry.entry_id):
         if row.platform == DOMAIN and (
-            (row.domain == Platform.SENSOR and row.unique_id not in active_ids)
+            (row.domain == Platform.SENSOR and row.unique_id not in active_ids | previews)
+            or (row.domain == Platform.BINARY_SENSOR and row.unique_id not in alarms)
             or (row.domain == Platform.BUTTON and row.unique_id not in buttons)
         ):
             registry.async_remove(row.entity_id)

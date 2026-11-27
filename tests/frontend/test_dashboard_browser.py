@@ -204,6 +204,81 @@ def test_native_card_contract_and_container_geometry(browser_page):
         (directory / "geometry.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
 
 
+def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        window.preview = (entity, kind, state, zone = 1, tank = 1, extra = {}) => ({
+            entity_id: entity, state, attributes: {uninus_water_thresholds: {
+                version: 1, zone_id: id(zone), tank_id: id(tank), kind, ...extra,
+            }},
+        });
+        window.states = {
+            'sensor.p1': projection(1), 'sensor.p2': projection(2, 2, 0),
+            'sensor.renamed_one': preview('sensor.renamed_one', 'refill_preview', 'refill_threshold'),
+            'binary_sensor.renamed_two': preview('binary_sensor.renamed_two', 'low_level_alarm', 'off'),
+            'sensor.wrong_zone': preview('sensor.wrong_zone', 'refill_preview', 'stop_threshold', 2),
+            'binary_sensor.extra_key': preview('binary_sensor.extra_key', 'low_level_alarm', 'on', 2, 2, {output: 'switch.x'}),
+        };
+        card.hass = snapshot(states);
+        document.querySelector('#area').append(card);
+    }""")
+    page.locator("fixture-tile").first.wait_for()
+    first = page.locator('[data-tank-id="00000000000000000000000000000001"]')
+    second = page.locator('[data-tank-id="00000000000000000000000000000002"]')
+    refill = first.locator('[data-preview-kind="refill_preview"]')
+    alarm = first.locator('[data-preview-kind="low_level_alarm"]')
+    assert first.locator("fixture-tile").count() == 3, "configured tank needs two read-only native tiles"
+    assert second.locator("fixture-tile").count() == 1
+    assert refill.locator(".body").inner_text() == "Refill threshold preview · refill_threshold"
+    assert alarm.locator(".body").inner_text() == "Alarm preview · off"
+    first.locator("fixture-tile .body").first.focus()
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    old = refill.element_handle()
+    assert refill.evaluate("el => el.shadowRoot.activeElement === el.shadowRoot.querySelector('.body')")
+    page.evaluate("""() => {
+        window.configBeforePreviewPush = activity.config;
+        states['sensor.renamed_one'] = {...states['sensor.renamed_one'], state: 'stop_threshold'};
+        states['binary_sensor.renamed_two'] = {...states['binary_sensor.renamed_two'], state: 'unavailable'};
+        card.hass = snapshot({...states});
+    }""")
+    assert refill.evaluate("(el, old) => el === old && el.shadowRoot.activeElement.className === 'body'", old)
+    assert page.evaluate("activity.config === configBeforePreviewPush")
+    assert "stop_threshold" in refill.locator(".body").inner_text()
+    assert "unavailable" in alarm.locator(".body").inner_text()
+    refill.locator(".body").click()
+    alarm.locator(".icon").click()
+    assert page.evaluate("activity.events") == [
+        ["hass-more-info", {"entityId": "sensor.renamed_one"}],
+        ["hass-more-info", {"entityId": "binary_sensor.renamed_two"}],
+    ]
+    # The valid refill claimant must not win over even a malformed duplicate.
+    # Other rejected wire frames must not attach to the other tank.
+    page.evaluate("""() => {
+        card.hass = snapshot({...states,
+            'switch.lookalike': preview('switch.lookalike', 'refill_preview', 'refill_threshold'),
+            'sensor.bad_version': preview('sensor.bad_version', 'refill_preview', 'refill_threshold', 2, 2, {version: 2}),
+            'binary_sensor.bad_state': preview('binary_sensor.bad_state', 'low_level_alarm', 'unknown', 2, 2),
+        });
+    }""")
+    assert refill.count() == 0
+    assert alarm.count() == 1
+    assert second.locator("fixture-tile").count() == 1
+    page.evaluate("""() => {
+        const withoutExtra = {...states};
+        delete withoutExtra['binary_sensor.extra_key'];
+        card.hass = snapshot({...withoutExtra,
+            'sensor.bad_version': preview('sensor.bad_version', 'refill_preview', 'refill_threshold', 2, 2, {version: 2}),
+            'binary_sensor.mismatched_key': preview('binary_sensor.different_entity_id', 'low_level_alarm', 'on', 2, 2),
+        }, 'zh-TW');
+    }""")
+    assert refill.locator(".body").inner_text() == "補水門檻預覽 · stop_threshold"
+    assert alarm.locator(".body").inner_text() == "低液位告警預覽 · unavailable"
+    assert second.locator("fixture-tile").count() == 1
+
+
 def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
     page = browser_page
     page.evaluate("""() => {

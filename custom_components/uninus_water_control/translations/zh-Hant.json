@@ -33,7 +33,8 @@
         "title": "管理水位監測清單",
         "menu_options": {
           "add_zone": "新增區域", "edit_zone": "重新命名區域", "remove_zone": "移除區域",
-          "add_tank": "新增水箱", "edit_tank": "編輯水箱", "remove_tank": "移除水箱"
+          "add_tank": "新增水箱", "edit_tank": "編輯水箱", "remove_tank": "移除水箱",
+          "edit_thresholds": "編輯門檻預覽"
         }
       },
       "add_zone": {
@@ -69,6 +70,16 @@
           "confirm_device_cutoff": "請實地確認輸出對應，並確認沒有其他控制器操作同一輸出。每個啟用的裝置都必須能在不依賴 Home Assistant 或網路的情況下安全關斷。勾選不代表已測試硬體；若無法驗證，請勿啟用。"
         }
       },
+      "save_thresholds": {
+        "title": "唯讀門檻預覽",
+        "description": "已選擇：{target}。每項功能請填寫兩個欄位；兩欄都留空即停用該功能。此預覽不操作開關，也不傳送通知。",
+        "data": {
+          "refill_lower_m": "補水下限",
+          "refill_upper_m": "停止上限",
+          "alarm_lower_m": "低液位告警下限",
+          "alarm_delay_seconds": "連續低液位告警延遲"
+        }
+      },
       "confirm_remove": {
         "title": "確認移除",
         "description": "確定要移除 {target} 嗎？移除區域時，該區域的所有水箱也會從此整合移除。來源感測器與開關不會變更。",
@@ -89,6 +100,10 @@
       "shared_output": "另一用途已參照此輸出或裝置；請先確認現場對應，排除共用。",
       "output_source_changed": "使用此實體 ID 的開關已變更。請重新開啟表單並選擇正確的開關。",
       "whole_seconds_required": "請輸入整數秒數。",
+      "finite_threshold_required": "請輸入有限數值。",
+      "threshold_pair_required": "請填寫該功能的兩個欄位，或將兩欄都清空以停用。",
+      "threshold_order": "停止上限必須高於補水下限。",
+      "positive_whole_delay": "請輸入至少 1 秒的整數。",
       "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
     },
     "abort": {
@@ -103,7 +118,18 @@
     "sensor": {
       "tank_level": {"name": "{zone} · {tank} 水位"},
       "refill_status": {"name": "{zone} · {tank} 補水狀態"},
-      "alarm_status": {"name": "{zone} · {tank} 警報狀態"}
+      "alarm_status": {"name": "{zone} · {tank} 警報狀態"},
+      "refill_preview": {
+        "name": "{zone} · {tank} 補水門檻預覽",
+        "state": {
+          "refill_threshold": "達補水門檻",
+          "between_thresholds": "門檻之間",
+          "stop_threshold": "達停止門檻"
+        }
+      }
+    },
+    "binary_sensor": {
+      "low_level_alarm": {"name": "{zone} · {tank} 低液位告警預覽"}
     },
     "button": {
       "refill_start": {"name": "{zone} · {tank} 開始補水"},

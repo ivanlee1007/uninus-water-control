@@ -33,7 +33,8 @@
         "title": "Manage the water inventory",
         "menu_options": {
           "add_zone": "Add zone", "edit_zone": "Rename zone", "remove_zone": "Remove zone",
-          "add_tank": "Add tank", "edit_tank": "Edit tank", "remove_tank": "Remove tank"
+          "add_tank": "Add tank", "edit_tank": "Edit tank", "remove_tank": "Remove tank",
+          "edit_thresholds": "Edit threshold previews"
         }
       },
       "add_zone": {
@@ -69,6 +70,16 @@
           "confirm_device_cutoff": "Verify the physical mapping and ensure no other controller uses the same output. Each enabled device must fail OFF independently of Home Assistant and the network. This checkbox does not test hardware. Leave both roles disabled if you cannot verify these conditions."
         }
       },
+      "save_thresholds": {
+        "title": "Read-only threshold previews",
+        "description": "Selection: {target}. Fill in both fields of each feature you want to use, or leave both blank to turn that feature off. These previews never operate switches or send notifications.",
+        "data": {
+          "refill_lower_m": "Refill lower threshold",
+          "refill_upper_m": "Stop upper threshold",
+          "alarm_lower_m": "Low-level alarm threshold",
+          "alarm_delay_seconds": "Continuous low-level alarm delay"
+        }
+      },
       "confirm_remove": {
         "title": "Confirm removal",
         "description": "Remove {target}? Removing a zone also removes all its tanks from this integration. Source sensors and switches are not changed.",
@@ -89,6 +100,10 @@
       "shared_output": "This output or device is referenced by another role. Verify and resolve the shared mapping first.",
       "output_source_changed": "The switch at this entity ID changed. Reopen the form and explicitly select the intended switch.",
       "whole_seconds_required": "Enter a whole number of seconds.",
+      "finite_threshold_required": "Enter a finite number.",
+      "threshold_pair_required": "Enter both fields for this feature, or clear both to disable it.",
+      "threshold_order": "The stop threshold must be higher than the refill threshold.",
+      "positive_whole_delay": "Enter a whole number of seconds, at least 1.",
       "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again."
     },
     "abort": {
@@ -103,7 +118,18 @@
     "sensor": {
       "tank_level": {"name": "{zone} · {tank} water level"},
       "refill_status": {"name": "{zone} · {tank} refill status"},
-      "alarm_status": {"name": "{zone} · {tank} alarm status"}
+      "alarm_status": {"name": "{zone} · {tank} alarm status"},
+      "refill_preview": {
+        "name": "{zone} · {tank} refill threshold preview",
+        "state": {
+          "refill_threshold": "Refill threshold reached",
+          "between_thresholds": "Between thresholds",
+          "stop_threshold": "Stop threshold reached"
+        }
+      }
+    },
+    "binary_sensor": {
+      "low_level_alarm": {"name": "{zone} · {tank} low-level alarm preview"}
     },
     "button": {
       "refill_start": {"name": "{zone} · {tank} start refill"},

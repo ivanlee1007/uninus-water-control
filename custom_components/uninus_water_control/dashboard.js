@@ -1,6 +1,16 @@
 const TAG = "uninus-water-dashboard";
 const ATTRIBUTE = "uninus_water_dashboard";
 const MANUAL = "uninus_water_manual";
+const PREVIEW = "uninus_water_thresholds";
+const PREVIEW_KEYS = ["version", "zone_id", "tank_id", "kind"];
+const PREVIEW_TYPES = new Map([
+  ["refill_preview", { domain: /^sensor\.[a-z0-9_]+$/,
+    states: ["refill_threshold", "between_thresholds", "stop_threshold", "unavailable"],
+    vertical: true, en: "Refill threshold preview", zhHant: "補水門檻預覽" }],
+  ["low_level_alarm", { domain: /^binary_sensor\.[a-z0-9_]+$/,
+    states: ["on", "off", "unavailable"],
+    en: "Alarm preview", zhHant: "低液位告警預覽" }],
+]);
 const ROLES = ["refill", "alarm"];
 const ACTIONS = ["start", "stop", "reset"];
 const PHASES = ["idle", "starting", "running", "stopping", "fault", "unknown"];
@@ -64,6 +74,7 @@ const STYLE = `
   .zone, [data-tank-id], .zone > *, [data-tank-id] > * { min-width: 0; }
   .zone { display: grid; gap: var(--grid-card-gap, 8px); }
   [data-tank-id] > *, .zone > :first-child { display: block; }
+  [data-preview-kind] { margin-block-start: 4px; }
   .notice { padding: 16px; color: var(--primary-text-color); }
   .manual {
     margin-block-start: 4px; padding: 6px 8px;
@@ -140,10 +151,40 @@ function manualFrom(states) {
   return byTank;
 }
 
+function validInventoryId(id) {
+  return typeof id === "string" && /^[0-9a-f]{32}$/.test(id);
+}
+
+const previewKey = (zone, tank) => `${zone}:${tank}`;
+
+function previewsFrom(states) {
+  const bySlot = new Map();
+  for (const [id, state] of Object.entries(states)) {
+    const wire = state?.attributes?.[PREVIEW];
+    if (!wire || typeof wire !== "object" || Array.isArray(wire)) continue;
+    const { zone_id, tank_id, kind } = wire;
+    const type = PREVIEW_TYPES.get(kind);
+    if (!type || !validInventoryId(zone_id) || !validInventoryId(tank_id)) continue;
+    const key = previewKey(zone_id, tank_id);
+    if (!bySlot.has(key)) bySlot.set(key, new Map());
+    const kinds = bySlot.get(key);
+    // Once a row claims the same slot, reject ambiguity even if one row is malformed.
+    if (kinds.has(kind)) {
+      kinds.set(kind, null);
+      continue;
+    }
+    const valid = Object.keys(wire).length === PREVIEW_KEYS.length &&
+      PREVIEW_KEYS.every((key) => Object.hasOwn(wire, key)) && wire.version === 1 &&
+      id === state.entity_id && type.domain.test(id) && type.states.includes(state.state);
+    kinds.set(kind, valid ? id : null);
+  }
+  return bySlot;
+}
+
 const byIndex = (a, b) => a.index - b.index;
 
 function validSlot(slot) {
-  return typeof slot?.id === "string" && /^[0-9a-f]{32}$/.test(slot.id) &&
+  return validInventoryId(slot?.id) &&
     typeof slot.name === "string" && Number.isSafeInteger(slot.index) && slot.index >= 0;
 }
 
@@ -209,6 +250,14 @@ function tileConfig(tank) {
   return {
     type: "tile", entity: tank.entity, name: tank.name,
     tap_action: { action: "more-info" }, icon_tap_action: { action: "more-info" },
+  };
+}
+
+function previewTileConfig(entity, name, vertical = false) {
+  return {
+    ...tileConfig({ entity, name }), vertical,
+    hold_action: { action: "none" }, double_tap_action: { action: "none" },
+    icon_hold_action: { action: "none" }, icon_double_tap_action: { action: "none" },
   };
 }
 
@@ -549,6 +598,8 @@ class UninusWaterDashboard extends HTMLElement {
   #updateCards(zones, helpers) {
     const focused = this.shadowRoot.activeElement;
     const manual = manualFrom(this.#hass.states);
+    const previews = previewsFrom(this.#hass.states);
+    const language = languageOf(this.#hass);
     const nextPanels = new Map();
     const nextZones = new Map();
     for (const zone of zones) {
@@ -575,13 +626,37 @@ class UninusWaterDashboard extends HTMLElement {
           host.dataset.tankId = tank.id;
           const tile = helpers.createCardElement(tileConfig(tank));
           host.append(tile);
-          slot = { host, tile, name: tank.name, entity: tank.entity };
+          slot = { host, tile, name: tank.name, entity: tank.entity, previews: new Map() };
         } else if (slot.name !== tank.name || slot.entity !== tank.entity) {
           slot.tile.setConfig(tileConfig(tank));
           slot.name = tank.name;
           slot.entity = tank.entity;
         }
         slot.tile.hass = this.#hass;
+        const available = previews.get(previewKey(zone.id, tank.id));
+        const nextPreviews = new Map();
+        for (const [kind, type] of PREVIEW_TYPES) {
+          const entity = available?.get(kind);
+          const previous = slot.previews.get(kind);
+          if (!entity) {
+            previous?.tile.remove();
+            continue;
+          }
+          const name = type[language];
+          let tile;
+          if (previous) {
+            tile = previous.tile;
+            if (previous.entity !== entity || previous.name !== name) {
+              tile.setConfig(previewTileConfig(entity, name, type.vertical));
+            }
+          } else {
+            tile = helpers.createCardElement(previewTileConfig(entity, name, type.vertical));
+            tile.dataset.previewKind = kind;
+          }
+          tile.hass = this.#hass;
+          nextPreviews.set(kind, { tile, entity, name });
+        }
+        slot.previews = nextPreviews;
         const oldRoles = this.#panels.get(tank.id);
         const newRoles = new Map();
         for (const role of ROLES) {
@@ -596,7 +671,8 @@ class UninusWaterDashboard extends HTMLElement {
         for (const [role, panel] of oldRoles ?? []) {
           if (!newRoles.has(role)) panel.host.remove();
         }
-        arrange(slot.host, [slot.tile, ...[...newRoles.values()].map(({ host }) => host)], focused);
+        arrange(slot.host, [slot.tile, ...[...nextPreviews.values()].map(({ tile }) => tile),
+          ...[...newRoles.values()].map(({ host }) => host)], focused);
         nextTiles.set(tank.id, slot);
       }
       for (const [id, slot] of current.tiles) {
@@ -623,7 +699,7 @@ if (!picker.some((card) => card.type === TAG)) {
   picker.push({
     type: TAG,
     name: "UNiNUS Water Dashboard",
-    description: "Water levels by zone, with native manual controls for commissioned tanks.",
+    description: "Water levels by zone, with read-only previews and separately commissioned manual controls.",
     preview: true,
   });
 }

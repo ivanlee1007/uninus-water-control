@@ -19,6 +19,7 @@ class Tank(TypedDict):
     alarm_switch: str | None
     refill_switch_registry_id: NotRequired[str]
     alarm_switch_registry_id: NotRequired[str]
+    thresholds: NotRequired[dict[str, float]]
 
 
 class Zone(TypedDict):
