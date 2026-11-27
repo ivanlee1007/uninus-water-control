@@ -1,0 +1,2 @@
+# Local Windows-only wheel override for Home Assistant's lru-dict pin.
+lru-dict==1.4.1
