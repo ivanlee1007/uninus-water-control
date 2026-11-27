@@ -1,6 +1,7 @@
 {
   "domain": "uninus_water_control",
   "name": "Uninus Water Control",
+  "after_dependencies": ["http"],
   "codeowners": [],
   "config_flow": true,
   "dependencies": ["sensor"],
