@@ -5,15 +5,15 @@ from __future__ import annotations
 from copy import deepcopy
 
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.selector import BooleanSelector, EntitySelector, SelectSelector, TextSelector
+from homeassistant.helpers.selector import BooleanSelector, EntitySelector, NumberSelector, SelectSelector, TextSelector
 
 from . import async_prune_disabled_levels
 from .inventory import DOMAIN, TITLE, Zone, inventory, level_source, new_tank, new_zone
+from .manual import DEFAULT_SECONDS, ROLES, output_conflicts, output_row, source_conflicts
 
 LEVEL_SENSOR = "level_sensor"
 ENTITY_FIELDS = {LEVEL_SENSOR: "sensor", "refill_switch": "switch", "alarm_switch": "switch"}
@@ -35,9 +35,7 @@ def _tank_fields(values: dict) -> dict:
 
 def _field_errors(hass: HomeAssistant, values: dict) -> dict[str, str]:
     errors = {
-        field: "blank_name"
-        for field in ("zone_name", "tank_name")
-        if field in values and not values[field].strip()
+        field: "blank_name" for field in ("zone_name", "tank_name") if field in values and not values[field].strip()
     }
     # The EntitySelector's filter is UI metadata and its validator accepts UUIDs.
     for field, domain in ENTITY_FIELDS.items():
@@ -78,11 +76,14 @@ class _LevelSuggestions:
                 # string are indistinguishable. Retain the first identity on replay.
                 errors[LEVEL_SENSOR] = "level_source_changed"
                 values[LEVEL_SENSOR] = (defaults or {}).get(LEVEL_SENSOR)
-        if (user_input is None or errors) and (suggested := values.get(LEVEL_SENSOR)):
+        return values, errors
+
+    def capture(self, registry: er.EntityRegistry, values: dict) -> None:
+        """Record what the form will show, after all submission checks."""
+        if suggested := values.get(LEVEL_SENSOR):
             row_id = self._row_id(registry, suggested)
             if self._shown.setdefault(suggested, row_id) != row_id:
                 values[LEVEL_SENSOR] = None
-        return values, errors
 
 
 class WaterControlConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -97,9 +98,8 @@ class WaterControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
         values, errors = self._level_suggestions.form_input(self.hass, user_input)
         if user_input is not None and not errors:
-            return self.async_create_entry(
-                title=TITLE, data={"zones": [new_zone(er.async_get(self.hass), user_input)]}
-            )
+            return self.async_create_entry(title=TITLE, data={"zones": [new_zone(er.async_get(self.hass), user_input)]})
+        self._level_suggestions.capture(er.async_get(self.hass), values)
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({**_text_field("zone_name", values), **_tank_fields(values)}),
@@ -124,6 +124,8 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         self._tank_index: int | None
         self._target_label: str
         self._level_suggestions = _LevelSuggestions()
+        self._manual_delta: dict = {}
+        self._shown_outputs: dict[str, str | None] = {}
 
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Take a draft snapshot and show available operations."""
@@ -159,8 +161,10 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
 
     def _require_fresh(self) -> ConfigEntry:
         entry = self.hass.config_entries.async_get_entry(self.handler)
-        if entry is not self._entry or entry is None or (
-            entry.options is not self._base_options or entry.data is not self._base_data
+        if (
+            entry is not self._entry
+            or entry is None
+            or (entry.options is not self._base_options or entry.data is not self._base_data)
         ):
             raise AbortFlow("configuration_changed")
         return entry
@@ -169,11 +173,18 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         # Core's OptionsFlowManager updates the options synchronously on this
         # return path; do not put an await between this check and that update.
         entry = self._require_fresh()
+        runtime = getattr(entry, "runtime_data", None)
+        if runtime and (runtime.retiring or any(not role.closed for role in runtime.roles.values())):
+            raise AbortFlow("manual_outputs_unsettled")
+        if (manual := self._base_options.get("manual")) and not any(
+            tank["id"] == manual["tank_id"] for zone in self._zones for tank in zone["tanks"]
+        ):
+            self._manual_delta = {"manual": {}}
         if entry.disabled_by and self._operation in ("remove_zone", "remove_tank"):
             # Disabled entries do not set up on reload. Read only the committed
             # native options on the next loop turn, never this private draft.
             self.hass.loop.call_soon(async_prune_disabled_levels, self.hass, entry)
-        return self.async_create_entry(data={**self._base_options, "zones": self._zones})
+        return self.async_create_entry(data={**self._base_options, "zones": self._zones} | self._manual_delta)
 
     def _choose(self, operation: str) -> ConfigFlowResult:
         self._operation = operation
@@ -242,6 +253,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             return self._commit()
         fields = _text_field("zone_name", values)
         if add:
+            self._level_suggestions.capture(er.async_get(self.hass), values)
             fields.update(_tank_fields(values))
         return self.async_show_form(step_id=step_id, data_schema=vol.Schema(fields), errors=errors)
 
@@ -253,20 +265,99 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         index = self._tank_index
         tank = self._zone["tanks"][index] if index is not None else None
         registry = er.async_get(self.hass)
-        defaults = dict(tank, tank_name=tank["name"], level_sensor=level_source(registry, tank)) if tank is not None else None
+        defaults = (
+            dict(tank, tank_name=tank["name"], level_sensor=level_source(registry, tank)) if tank is not None else None
+        )
+        if defaults is not None:
+            for role in ROLES:
+                field = f"{role}_switch"
+                if row_id := tank.get(f"{field}_registry_id"):
+                    row = registry.async_get(row_id)
+                    defaults[field] = row.entity_id if row else None
         values, errors = self._level_suggestions.form_input(self.hass, user_input, defaults)
+        manual = self._base_options.get("manual") or {}
+        if tank is not None and user_input is not None and not errors:
+            self._manual_delta, errors = self._commission(registry, tank, user_input, manual)
         if user_input is not None and not errors:
             if index is None:
                 self._zone["tanks"].append(new_tank(registry, user_input))
             else:
                 self._zone["tanks"][index] = new_tank(registry, user_input, tank["id"])
             return self._commit()
+        # Any rejected submission, including cutoff confirmation, can echo a
+        # newly selected entity. Capture identities only once rendering is known.
+        self._level_suggestions.capture(registry, values)
+        if tank is not None:
+            for role in ROLES:
+                field = f"{role}_switch"
+                if ident := values.get(field):
+                    row = registry.async_get(ident)
+                    actual = row.id if row else None
+                    if self._shown_outputs.setdefault(ident, actual) != actual:
+                        values[field] = None
+        fields = _tank_fields(values)
+        if tank is not None:
+            for role in ROLES:
+                field = f"commission_{role}"
+                fields[vol.Optional(field, description={"suggested_value": values.get(field, False)})] = (
+                    BooleanSelector()
+                )
+                seconds = f"{role}_max_runtime_seconds"
+                saved = (manual.get(role) or {}).get("max_runtime_seconds", DEFAULT_SECONDS)
+                fields[vol.Optional(seconds, description={"suggested_value": values.get(seconds, saved)})] = (
+                    NumberSelector({"min": 1, "max": 300, "step": 1, "mode": "box", "unit_of_measurement": "s"})
+                )
+            fields[vol.Optional("confirm_device_cutoff")] = BooleanSelector()
         return self.async_show_form(
             step_id="save_tank",
             description_placeholders={"target": self._target_label},
-            data_schema=vol.Schema(_tank_fields(values)),
+            data_schema=vol.Schema(fields),
             errors=errors,
         )
+
+    def _commission(self, registry, tank, values, manual):
+        tank_id = tank["id"]
+        requested = [role for role in ROLES if values.get(f"commission_{role}") is True]
+        if not requested:
+            return ({"manual": {}} if manual.get("tank_id") == tank_id else {}), {}
+        if manual and manual.get("tank_id") != tank_id:
+            return {}, {f"commission_{role}": "one_manual_tank" for role in requested}
+        if values.get("confirm_device_cutoff") is not True:
+            return {}, {"confirm_device_cutoff": "cutoff_required"}
+        proposed = new_tank(registry, values, tank_id)
+        zones = [
+            dict(zone, tanks=[proposed if t["id"] == tank_id else t for t in zone["tanks"]]) for zone in self._zones
+        ]
+        settings = {"tank_id": tank_id}
+        for role in requested:
+            field = f"{role}_switch"
+            entity_id = values.get(field, "")
+            output = output_row(registry, entity_id)
+            if output is None:
+                return {}, {field: "registered_output_required"}
+            if self._shown_outputs.get(entity_id, output.id) != output.id:
+                return {}, {field: "output_source_changed"}
+            if output_conflicts(registry, zones, tank_id, role, output):
+                return {}, {field: "shared_output"}
+            source_id = None
+            if role == "refill":
+                source = registry.async_get(values[LEVEL_SENSOR])
+                if source is None or source.disabled_by:
+                    return {}, {LEVEL_SENSOR: "registered_source_required"}
+                if source_conflicts(zones, tank_id, source):
+                    return {}, {LEVEL_SENSOR: "shared_source"}
+                source_id = source.id
+            seconds_field = f"{role}_max_runtime_seconds"
+            seconds = values.get(seconds_field, DEFAULT_SECONDS)
+            if not float(seconds).is_integer():
+                return {}, {seconds_field: "whole_seconds_required"}
+            settings[role] = {
+                "output": output.id,
+                "source": source_id,
+                "cutoff_confirmed": True,
+                "max_runtime_seconds": int(seconds),
+            }
+        return {"manual": settings}, {}
 
     async def async_step_confirm_remove(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self._confirm_remove(user_input)

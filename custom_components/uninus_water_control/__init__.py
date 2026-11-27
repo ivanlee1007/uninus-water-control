@@ -1,4 +1,4 @@
-"""Uninus Water Control: a read-only inventory and sensor platform."""
+"""Uninus Water Control: inventory, monitoring and commissioned manual control."""
 
 from pathlib import Path
 
@@ -8,6 +8,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 
 from .inventory import DOMAIN, inventory
+from .manual import ACTIONS, ROLES, ManualController
 
 PLATFORMS = [Platform.SENSOR]
 
@@ -37,9 +38,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 def _async_prune_levels(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove registry records for deleted tanks, and only those we own."""
     active_ids = {tank["id"] for zone in inventory(entry) for tank in zone["tanks"]}
+    manual = entry.options.get("manual") or {}
+    tank_id = manual.get("tank_id")
+    roles = [role for role in ROLES if tank_id in active_ids and manual.get(role)]
+    buttons = {f"{tank_id}_{role}_{action}" for role in roles for action in ACTIONS}
+    active_ids.update(f"{tank_id}_{role}_status" for role in roles)
     registry = er.async_get(hass)
     for row in er.async_entries_for_config_entry(registry, entry.entry_id):
-        if row.platform == DOMAIN and row.domain == Platform.SENSOR and row.unique_id not in active_ids:
+        if row.platform == DOMAIN and (
+            (row.domain == Platform.SENSOR and row.unique_id not in active_ids)
+            or (row.domain == Platform.BUTTON and row.unique_id not in buttons)
+        ):
             registry.async_remove(row.entity_id)
 
 
@@ -53,13 +62,24 @@ def async_prune_disabled_levels(hass: HomeAssistant, entry: ConfigEntry) -> None
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Reconcile the registry and load the current sensors."""
     _async_prune_levels(hass, entry)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.runtime_data = ManualController(hass, entry)
+    platforms = [*PLATFORMS, Platform.BUTTON] if entry.runtime_data.roles else PLATFORMS
+    await hass.config_entries.async_forward_entry_setups(entry, platforms)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload the sensors and their source listeners before pruning stale rows."""
-    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+    runtime = entry.runtime_data
+    if not await runtime.async_close():
+        # Core has already entered UNLOAD_IN_PROGRESS and a false result is
+        # terminal (FAILED_UNLOAD). Keep the old owner for late OFF cleanup.
+        runtime.require_restart()
         return False
+    platforms = [*PLATFORMS, Platform.BUTTON] if runtime.roles else PLATFORMS
+    if not await hass.config_entries.async_unload_platforms(entry, platforms):
+        runtime.require_restart()
+        return False
+    runtime.detach()
     _async_prune_levels(hass, entry)
     return True

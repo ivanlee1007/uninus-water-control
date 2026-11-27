@@ -54,13 +54,19 @@
       },
       "save_tank": {
         "title": "Tank settings",
-        "description": "Selection: {target}. Choose a level sensor reporting m, cm, or mm. Switch bindings are optional and are not operated by this integration.",
+        "description": "Selection: {target}. Switch bindings are references unless you explicitly commission manual control. Stop both outputs before editing. Only one tank can be commissioned.",
         "data": {
           "tank_name": "Tank name", "level_sensor": "Liquid-level sensor",
-          "refill_switch": "Refill switch (optional)", "alarm_switch": "Alarm switch (optional)"
+          "refill_switch": "Refill switch (optional)", "alarm_switch": "Alarm switch (optional)",
+          "commission_refill": "Commission manual refill",
+          "commission_alarm": "Commission manual alarm",
+          "confirm_device_cutoff": "I verified exclusive outputs and an independent device cutoff for each enabled role",
+          "refill_max_runtime_seconds": "Refill HA runtime limit",
+          "alarm_max_runtime_seconds": "Alarm HA runtime limit"
         },
         "data_description": {
-          "level_sensor": "Registered sensors are followed when renamed. If the binding is missing or only its old entity ID was saved, select the intended registered sensor again. Unregistered sensors cannot be distinguished from another unregistered sensor using the same entity ID."
+          "level_sensor": "Registered sensors are followed when renamed. Refill requires an unshared registered level sensor reporting m, cm, or mm.",
+          "confirm_device_cutoff": "Verify the physical mapping and ensure no other controller uses the same output. Each enabled device must fail OFF independently of Home Assistant and the network. This checkbox does not test hardware. Leave both roles disabled if you cannot verify these conditions."
         }
       },
       "confirm_remove": {
@@ -75,10 +81,19 @@
       "invalid_switch": "Select a switch entity or leave this field empty.",
       "own_level_sensor": "Choose a source sensor, not a level sensor created by this integration.",
       "confirm_required": "Turn on the confirmation to remove this selection.",
+      "one_manual_tank": "Decommission the other tank before commissioning this tank.",
+      "cutoff_required": "Verify the exclusive physical mapping and independent device cutoff before enabling control.",
+      "registered_output_required": "Select an enabled, registered switch. Known virtual or grouped switches cannot be used.",
+      "registered_source_required": "Refill requires an enabled, registered level sensor.",
+      "shared_source": "The level source is already referenced by another tank. Verify the physical mapping first.",
+      "shared_output": "This output or device is referenced by another role. Verify and resolve the shared mapping first.",
+      "output_source_changed": "The switch at this entity ID changed. Reopen the form and explicitly select the intended switch.",
+      "whole_seconds_required": "Enter a whole number of seconds.",
       "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again."
     },
     "abort": {
       "configuration_changed": "The configuration changed while this form was open. Open Configure again and retry.",
+      "manual_outputs_unsettled": "Stop manual controls and wait for OFF feedback and any outstanding commands before editing.",
       "invalid_target": "The selected zone or tank does not exist.",
       "minimum_zones": "The controller must contain at least one zone.",
       "minimum_tanks": "Each zone must contain at least one tank. To remove the whole zone, use Remove zone."
@@ -86,7 +101,17 @@
   },
   "entity": {
     "sensor": {
-      "tank_level": {"name": "{zone} · {tank} water level"}
+      "tank_level": {"name": "{zone} · {tank} water level"},
+      "refill_status": {"name": "{zone} · {tank} refill status"},
+      "alarm_status": {"name": "{zone} · {tank} alarm status"}
+    },
+    "button": {
+      "refill_start": {"name": "{zone} · {tank} start refill"},
+      "refill_stop": {"name": "{zone} · {tank} stop refill"},
+      "refill_reset": {"name": "{zone} · {tank} reset refill fault"},
+      "alarm_start": {"name": "{zone} · {tank} start alarm"},
+      "alarm_stop": {"name": "{zone} · {tank} stop alarm"},
+      "alarm_reset": {"name": "{zone} · {tank} reset alarm fault"}
     }
   }
 }

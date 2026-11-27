@@ -54,13 +54,19 @@
       },
       "save_tank": {
         "title": "水箱設定",
-        "description": "已選擇：{target}。請選擇以公尺（m）、公分（cm）或毫米（mm）回報水位的感測器。開關綁定為選填，且此整合不會操作開關。",
+        "description": "已選擇：{target}。除非明確啟用手動控制，否則開關綁定僅供參考。編輯前請先停止兩個輸出。一次只能啟用一個水箱。",
         "data": {
           "tank_name": "水箱名稱", "level_sensor": "液位感測器",
-          "refill_switch": "補水開關（選填）", "alarm_switch": "警報開關（選填）"
+          "refill_switch": "補水開關（選填）", "alarm_switch": "警報開關（選填）",
+          "commission_refill": "啟用手動補水",
+          "commission_alarm": "啟用手動警報",
+          "confirm_device_cutoff": "我已確認每個啟用的輸出皆為獨用，且裝置具備獨立關斷保護",
+          "refill_max_runtime_seconds": "補水的 HA 運轉上限",
+          "alarm_max_runtime_seconds": "警報的 HA 運轉上限"
         },
         "data_description": {
-          "level_sensor": "已登錄的感測器重新命名後仍可追蹤。若綁定已遺失或先前只儲存實體 ID，請重新選擇要綁定的已登錄感測器。使用相同實體 ID 的未登錄感測器無法彼此區分。"
+          "level_sensor": "已登錄的感測器重新命名後仍可追蹤。補水需要已登錄、未與其他水箱共用，且以 m、cm 或 mm 回報的水位感測器。",
+          "confirm_device_cutoff": "請實地確認輸出對應，並確認沒有其他控制器操作同一輸出。每個啟用的裝置都必須能在不依賴 Home Assistant 或網路的情況下安全關斷。勾選不代表已測試硬體；若無法驗證，請勿啟用。"
         }
       },
       "confirm_remove": {
@@ -75,10 +81,19 @@
       "invalid_switch": "請選擇開關實體，或將此欄位留空。",
       "own_level_sensor": "請選擇來源感測器，勿選擇由此整合建立的水位感測器。",
       "confirm_required": "請開啟確認選項，才能移除所選項目。",
+      "one_manual_tank": "請先停用另一水箱的手動控制，再啟用此水箱。",
+      "cutoff_required": "啟用前請先驗證輸出為獨用，且裝置具備獨立關斷保護。",
+      "registered_output_required": "請選擇已登錄且啟用的開關。不可使用已知的虛擬開關或群組。",
+      "registered_source_required": "補水需要已登錄且啟用的水位感測器。",
+      "shared_source": "另一個水箱已參照此水位來源；請先確認現場對應。",
+      "shared_output": "另一用途已參照此輸出或裝置；請先確認現場對應，排除共用。",
+      "output_source_changed": "使用此實體 ID 的開關已變更。請重新開啟表單並選擇正確的開關。",
+      "whole_seconds_required": "請輸入整數秒數。",
       "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
     },
     "abort": {
       "configuration_changed": "此表單開啟後，設定已變更。請重新開啟「設定」並再試一次。",
+      "manual_outputs_unsettled": "請先停止手動控制，並等待關閉回報及未完成指令，再編輯設定。",
       "invalid_target": "所選區域或水箱不存在。",
       "minimum_zones": "控制器必須至少包含一個區域。",
       "minimum_tanks": "每個區域必須至少包含一個水箱。若要移除整個區域，請使用「移除區域」。"
@@ -86,7 +101,17 @@
   },
   "entity": {
     "sensor": {
-      "tank_level": {"name": "{zone} · {tank} 水位"}
+      "tank_level": {"name": "{zone} · {tank} 水位"},
+      "refill_status": {"name": "{zone} · {tank} 補水狀態"},
+      "alarm_status": {"name": "{zone} · {tank} 警報狀態"}
+    },
+    "button": {
+      "refill_start": {"name": "{zone} · {tank} 開始補水"},
+      "refill_stop": {"name": "{zone} · {tank} 停止補水"},
+      "refill_reset": {"name": "{zone} · {tank} 清除補水故障"},
+      "alarm_start": {"name": "{zone} · {tank} 啟動警報"},
+      "alarm_stop": {"name": "{zone} · {tank} 停止警報"},
+      "alarm_reset": {"name": "{zone} · {tank} 清除警報故障"}
     }
   }
 }

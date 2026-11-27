@@ -17,6 +17,8 @@ class Tank(TypedDict):
     level_sensor_registry_id: NotRequired[str]
     refill_switch: str | None
     alarm_switch: str | None
+    refill_switch_registry_id: NotRequired[str]
+    alarm_switch_registry_id: NotRequired[str]
 
 
 class Zone(TypedDict):
@@ -36,6 +38,9 @@ def new_tank(registry: EntityRegistry, fields: dict, tank_id: str | None = None)
     )
     if source := registry.async_get(tank["level_sensor"]):
         tank["level_sensor_registry_id"] = source.id
+    for field in ("refill_switch", "alarm_switch"):
+        if (ident := tank[field]) and (row := registry.async_get(ident)):
+            tank[f"{field}_registry_id"] = row.id
     return tank
 
 

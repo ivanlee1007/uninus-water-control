@@ -26,6 +26,31 @@ async def async_setup_entry(
         for zone_index, zone in enumerate(inventory(entry))
         for tank_index, tank in enumerate(zone["tanks"])
     )
+    async_add_entities(ManualStatus(role) for role in entry.runtime_data.roles.values())
+
+
+class ManualStatus(SensorEntity):
+    """A command and HA feedback snapshot, never a claim of physical flow."""
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+
+    def __init__(self, role):
+        self._role = role
+        self._attr_unique_id = f"{role.owner.tank_id}_{role.name}_status"
+        self._attr_translation_key = f"{role.name}_status"
+        self._attr_translation_placeholders = role.owner.labels
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(self._role.subscribe(self.async_write_ha_state))
+
+    @property
+    def native_value(self):
+        return self._role.snapshot()["phase"]
+
+    @property
+    def extra_state_attributes(self):
+        return {"uninus_water_manual": self._role.identity("status") | self._role.snapshot()}
 
 
 class TankLevel(SensorEntity):
@@ -63,9 +88,7 @@ class TankLevel(SensorEntity):
 
     async def async_added_to_hass(self) -> None:
         """Subscribe and read the initial state without an intervening yield."""
-        self.async_on_remove(
-            self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._async_registry_changed)
-        )
+        self.async_on_remove(self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._async_registry_changed))
         self.async_on_remove(self._async_clear_source)
         self._async_refresh_source(level_source(er.async_get(self.hass), self._tank))
 
@@ -82,9 +105,7 @@ class TankLevel(SensorEntity):
             self._async_clear_source()
             self._source = source
             if source is not None:
-                self._unsub_source = async_track_state_change_event(
-                    self.hass, [source], self._async_source_changed
-                )
+                self._unsub_source = async_track_state_change_event(self.hass, [source], self._async_source_changed)
         self._read_source(self.hass.states.get(source) if source is not None else None)
 
     @callback

@@ -418,3 +418,137 @@ def test_malformed_or_conflicting_projections_cannot_create_tiles(browser_page):
     assert page.evaluate("activity.cards.filter(({type}) => type === 'tile').map(({entity}) => entity)") == [
         "sensor.good"
     ]
+
+
+def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        customElements.define('ha-button', class extends HTMLElement {
+            constructor() {
+                super();
+                this.attachShadow({mode: 'open', delegatesFocus: true});
+                this.shadowRoot.innerHTML = '<button><slot></slot></button>';
+            }
+            set disabled(value) { this.shadowRoot.querySelector('button').disabled = value; }
+            get disabled() { return this.shadowRoot.querySelector('button').disabled; }
+        });
+        window.manual = (role, action, overrides = {}) => {
+            const entity_id = `${action === 'status' ? 'sensor' : 'button'}.${role}_${action}`;
+            return {entity_id, state: action === 'status' ? overrides.phase ?? 'idle' : 'unknown',
+                attributes: {uninus_water_manual: {version: 1, tank_id: id(1), role, action,
+                    ...(action === 'status' ? {phase: 'idle', requested: 'off', actual: 'off',
+                        pending_on: false, pending_off: false, fault: null, max_runtime_seconds: 60,
+                        can_start: true} : {}), ...overrides}}};
+        };
+        window.states = {'sensor.p1': projection(1), 'sensor.p2': projection(2)};
+        for (const role of ['refill', 'alarm']) {
+            for (const action of ['status', 'start', 'stop', 'reset']) {
+                const state = manual(role, action);
+                states[state.entity_id] = state;
+            }
+        }
+        window.calls = [];
+        window.service = (...args) => {
+            calls.push(args);
+            return new Promise((resolve, reject) => calls[calls.length - 1].settle = {resolve, reject});
+        };
+        window.push = (language = 'en') => {
+            card.hass = {...snapshot({...states}, language), connected: true, callService: service};
+        };
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        push();
+        document.querySelector('#area').append(card);
+    }""")
+    tank = page.locator(f'[data-tank-id="{1:032x}"]')
+    refill = tank.locator('[data-manual-role="refill"]')
+    alarm = tank.locator('[data-manual-role="alarm"]')
+    start = refill.get_by_role("button", name="Start", exact=True)
+    stop = refill.get_by_role("button", name="Stop", exact=True)
+    reset = refill.get_by_role("button", name="Clear fault", exact=True)
+    dialog = page.get_by_role("dialog")
+    start.click()
+    assert dialog.is_visible()
+    assert page.evaluate("calls.length") == 0
+    page.keyboard.press("Escape")
+    assert not dialog.is_visible()
+    assert start.evaluate("b => b.getRootNode().activeElement === b.parentNode || b === b.getRootNode().activeElement")
+    assert reset.is_disabled()
+    assert page.locator(f'[data-tank-id="{2:032x}"] [data-manual-role]').count() == 0
+    start.click()
+    dialog.get_by_role("button", name="Confirm start", exact=True).click()
+    assert page.evaluate("calls") == [["button", "press", {}, {"entity_id": "button.refill_start"}]]
+    assert refill.get_by_text("HA feedback: Off", exact=False).is_visible()
+    assert start.is_disabled()
+    page.evaluate("""() => {
+        states['button.renamed_refill_start'] = {...states['button.refill_start'], entity_id: 'button.renamed_refill_start'};
+        delete states['button.refill_start'];
+        push();
+    }""")
+    assert start.is_disabled(), "renaming an entity cannot retire its unresolved logical Start"
+    assert stop.is_enabled()
+    before = stop.bounding_box()
+    stop.focus()
+    page.evaluate("""() => {
+        states['sensor.refill_status'] = manual('refill', 'status', {
+            phase: 'starting', requested: 'on', pending_on: true, can_start: false});
+        push();
+    }""")
+    assert stop.evaluate("b => b.getRootNode().activeElement === b.parentNode || b === b.getRootNode().activeElement")
+    assert stop.bounding_box() == before
+    assert refill.get_by_text("Starting", exact=False).is_visible()
+    alarm.get_by_role("button", name="Start", exact=True).click()
+    assert dialog.is_visible()
+    stop.click()
+    assert not dialog.is_visible(), "cross-role confirmation must not block Stop during ON"
+    assert page.evaluate("calls[1]") == ["button", "press", {}, {"entity_id": "button.refill_stop"}]
+    assert stop.is_disabled()
+    alarm.get_by_role("button", name="Start", exact=True).click()
+    page.evaluate("""() => {
+        states['button.alarm_duplicate'] = {...states['button.alarm_start'], entity_id: 'button.alarm_duplicate'};
+        push();
+    }""")
+    assert not dialog.is_visible()
+    assert alarm.get_by_role("button", name="Start", exact=True).is_disabled()
+    assert page.evaluate("calls.length") == 2
+    page.evaluate("""() => {
+        delete states['button.alarm_duplicate'];
+        states['sensor.refill_status'] = manual('refill', 'status', {
+            phase: 'fault', fault: 'on_unconfirmed', can_start: false});
+        calls[0].settle.reject(new Error('raw private error'));
+        calls[1].settle.resolve();
+        push();
+    }""")
+    assert not page.get_by_text("raw private error", exact=False).count()
+    reset.click()
+    assert page.evaluate("calls[2]") == ["button", "press", {}, {"entity_id": "button.refill_reset"}]
+    page.evaluate("""() => {
+        states['button.alarm_start'] = manual('alarm', 'start', {version: '1'});
+        push('zh-Hant');
+    }""")
+    assert alarm.get_by_role("button", name="開始", exact=True).is_disabled()
+    assert refill.get_by_text("HA 回報：關閉", exact=False).is_visible()
+    page.evaluate("""() => {
+        calls[2].settle.resolve();
+        states['sensor.refill_status'] = manual('refill', 'status', {
+            phase: 'fault', fault: 'restart_required', can_start: false});
+        push('zh-Hant');
+    }""")
+    assert refill.get_by_text("請重新啟動 Home Assistant", exact=False).is_visible()
+    assert refill.get_by_role("button", name="清除故障", exact=True).is_disabled()
+    assert refill.get_by_role("button", name="開始", exact=True).is_disabled()
+    assert refill.get_by_role("button", name="停止", exact=True).is_enabled()
+    page.evaluate("""() => {
+        states['sensor.alarm_status'] = {...states['sensor.alarm_status'], state: 'unavailable'};
+        push();
+    }""")
+    assert alarm.get_by_text("HA feedback: Unknown", exact=True).is_visible()
+    assert alarm.get_by_role("button", name="Stop", exact=True).is_enabled()
+    assert alarm.get_by_role("button", name="Clear fault", exact=True).is_disabled()
+    page.evaluate("""() => {
+        const old = states['button.alarm_stop'];
+        states['button.alarm_bad'] = {...old, entity_id: 'switch.bad'};
+        push();
+    }""")
+    assert alarm.get_by_role("button", name="Stop", exact=True).is_disabled()
+    assert page.evaluate("calls.length") == 3
