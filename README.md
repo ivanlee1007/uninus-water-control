@@ -2,9 +2,17 @@
 
 Home Assistant 補水控制，採原生 UI 優先。區域與水桶可依現場配置增減，每桶個別指定液位感測器，補水與告警開關各自選配。
 
-## 開發狀態
+## HA Marketplace 安裝
 
-本儲存庫是私有開發專案，尚未發布。第一個增量是 **HA 原生整合設定 → 可放上原生 Tile 的唯讀液位實體**。可自適應的原生 Dashboard、受保護的補水／告警控制與實機驗收分階段交付，不屬於第一個增量的完成聲明。
+[在 Home Assistant Marketplace 開啟 UNiNUS Water Control](https://my.home-assistant.io/redirect/marketplace_repository/?owner=ivanlee1007&repository=uninus-water-control&category=integration)
+
+也可到 Home Assistant **設定 → Marketplace → 從連結新增**，貼上本 GitHub 儲存庫網址，類別選 **整合（Integration）**，再安裝 UNiNUS Water Control。安裝後，到 **設定 → 裝置與服務 → 新增整合**，搜尋 UNiNUS Water Control。儀表板模組隨整合提供，依[原生儀表板設定](docs/NATIVE-DASHBOARD.md)加入，不必另裝卡片套件。
+
+這是自訂儲存庫安裝方式，並非 Marketplace 預設目錄上架。
+
+## 功能與使用限制
+
+已提供可增減的區域與水桶、原生液位實體、自適應總覽、選配的單桶手動補水與警報，以及不操作設備的門檻與延遲告警預覽。自動補水、正式告警通知與實體設備驗收未完成。請先在測試 HA 使用模擬感測器和輸出。
 
 - HA 設定流程負責區域、水桶、名稱與實體綁定；Dashboard 不負責設備配對。
 - Dashboard 優先使用原生 Sections、Tile、Button、Number、History 等元件。只有原生做不到的動態配置或尺寸規則才考慮最薄的自訂層，不重做整套 HA UI。
