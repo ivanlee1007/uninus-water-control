@@ -1,0 +1,10 @@
+{
+  "domain": "uninus_water_control",
+  "name": "Uninus Water Control",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["sensor"],
+  "integration_type": "hub",
+  "iot_class": "calculated",
+  "version": "0.1.0"
+}
