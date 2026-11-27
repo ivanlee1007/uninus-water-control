@@ -1,5 +1,7 @@
 """Uninus Water Control: a read-only inventory and sensor platform."""
 
+from pathlib import Path
+
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
@@ -8,6 +10,27 @@ from homeassistant.helpers import entity_registry as er
 from .inventory import DOMAIN, inventory
 
 PLATFORMS = [Platform.SENSOR]
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Expose the single public module when Core has an HTTP server."""
+    if hass.http is not None:
+        from aiohttp import web
+        from homeassistant.helpers.http import HomeAssistantView
+
+        class DashboardModuleView(HomeAssistantView):
+            url = f"/{DOMAIN}/dashboard.js"
+            name = f"{DOMAIN}:dashboard"
+            requires_auth = False
+
+            async def get(self, request: web.Request) -> web.FileResponse:
+                return web.FileResponse(
+                    Path(__file__).with_name("dashboard.js"),
+                    headers={"Content-Type": "text/javascript", "Cache-Control": "no-store"},
+                )
+
+        hass.http.register_view(DashboardModuleView)
+    return True
 
 
 @callback

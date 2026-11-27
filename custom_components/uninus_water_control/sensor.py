@@ -1,6 +1,7 @@
 """Read-only tank level sensors."""
 
 from math import isfinite
+from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
@@ -20,7 +21,11 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     """Expose exactly one level sensor for each tank."""
-    async_add_entities(TankLevel(zone, tank) for zone in inventory(entry) for tank in zone["tanks"])
+    async_add_entities(
+        TankLevel(zone, tank, zone_index, tank_index)
+        for zone_index, zone in enumerate(inventory(entry))
+        for tank_index, tank in enumerate(zone["tanks"])
+    )
 
 
 class TankLevel(SensorEntity):
@@ -36,13 +41,25 @@ class TankLevel(SensorEntity):
     _attr_native_value = None
     _attr_available = False
 
-    def __init__(self, zone: Zone, tank: Tank) -> None:
+    def __init__(self, zone: Zone, tank: Tank, zone_index: int, tank_index: int) -> None:
         """Bind one stable tank identity to its configured source."""
         self._attr_unique_id = tank["id"]
         self._attr_translation_placeholders = {"zone": zone["name"], "tank": tank["name"]}
+        self._attr_extra_state_attributes = {
+            "uninus_water_dashboard": {
+                "version": 1,
+                "zone": {"id": zone["id"], "name": zone["name"], "index": zone_index},
+                "tank": {"id": tank["id"], "name": tank["name"], "index": tank_index},
+            }
+        }
         self._tank = tank
         self._source: str | None = None
         self._unsub_source: CALLBACK_TYPE | None = None
+
+    @property
+    def capability_attributes(self) -> dict[str, Any]:
+        """Keep layout metadata discoverable when Core omits unavailable state extras."""
+        return (super().capability_attributes or {}) | self._attr_extra_state_attributes
 
     async def async_added_to_hass(self) -> None:
         """Subscribe and read the initial state without an intervening yield."""
