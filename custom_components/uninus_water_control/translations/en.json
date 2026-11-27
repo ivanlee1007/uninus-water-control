@@ -1,0 +1,92 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up water monitoring",
+        "description": "Add the first zone and tank. Switch bindings are saved for reference only; this integration does not operate them.",
+        "data": {
+          "zone_name": "Zone name",
+          "tank_name": "Tank name",
+          "level_sensor": "Liquid-level sensor",
+          "refill_switch": "Refill switch (optional)",
+          "alarm_switch": "Alarm switch (optional)"
+        },
+        "data_description": {
+          "level_sensor": "Choose a sensor that reports depth in m, cm, or mm. Unregistered sensors are tracked only by entity ID, so replacing one with another unregistered sensor at the same ID cannot be detected."
+        }
+      }
+    },
+    "error": {
+      "blank_name": "Enter a name.",
+      "invalid_sensor": "Select a sensor entity.",
+      "invalid_switch": "Select a switch entity or leave this field empty.",
+      "own_level_sensor": "Choose a source sensor, not a level sensor created by this integration.",
+      "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again."
+    },
+    "abort": {
+      "already_configured": "The water controller is already configured. Use Configure to manage its inventory."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Manage the water inventory",
+        "menu_options": {
+          "add_zone": "Add zone", "edit_zone": "Rename zone", "remove_zone": "Remove zone",
+          "add_tank": "Add tank", "edit_tank": "Edit tank", "remove_tank": "Remove tank"
+        }
+      },
+      "add_zone": {
+        "title": "Add a zone and its first tank",
+        "description": "Switch bindings are optional and are not operated by this integration.",
+        "data": {
+          "zone_name": "Zone name", "tank_name": "Tank name", "level_sensor": "Liquid-level sensor",
+          "refill_switch": "Refill switch (optional)", "alarm_switch": "Alarm switch (optional)"
+        }
+      },
+      "select_target": {
+        "title": "Choose a zone or tank",
+        "data": {"zone_id": "Zone", "tank_id": "Tank"}
+      },
+      "rename_zone": {
+        "title": "Rename zone",
+        "data": {"zone_name": "Zone name"}
+      },
+      "save_tank": {
+        "title": "Tank settings",
+        "description": "Selection: {target}. Choose a level sensor reporting m, cm, or mm. Switch bindings are optional and are not operated by this integration.",
+        "data": {
+          "tank_name": "Tank name", "level_sensor": "Liquid-level sensor",
+          "refill_switch": "Refill switch (optional)", "alarm_switch": "Alarm switch (optional)"
+        },
+        "data_description": {
+          "level_sensor": "Registered sensors are followed when renamed. If the binding is missing or only its old entity ID was saved, select the intended registered sensor again. Unregistered sensors cannot be distinguished from another unregistered sensor using the same entity ID."
+        }
+      },
+      "confirm_remove": {
+        "title": "Confirm removal",
+        "description": "Remove {target}? Removing a zone also removes all its tanks from this integration. Source sensors and switches are not changed.",
+        "data": {"confirm": "Yes, remove this selection"}
+      }
+    },
+    "error": {
+      "blank_name": "Enter a name.",
+      "invalid_sensor": "Select a sensor entity.",
+      "invalid_switch": "Select a switch entity or leave this field empty.",
+      "own_level_sensor": "Choose a source sensor, not a level sensor created by this integration.",
+      "confirm_required": "Turn on the confirmation to remove this selection.",
+      "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again."
+    },
+    "abort": {
+      "configuration_changed": "The configuration changed while this form was open. Open Configure again and retry.",
+      "invalid_target": "The selected zone or tank does not exist.",
+      "minimum_zones": "The controller must contain at least one zone.",
+      "minimum_tanks": "Each zone must contain at least one tank. To remove the whole zone, use Remove zone."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "tank_level": {"name": "{zone} · {tank} water level"}
+    }
+  }
+}

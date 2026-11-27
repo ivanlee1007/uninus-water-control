@@ -1,0 +1,92 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "設定水位監測",
+        "description": "新增第一個區域與水箱。開關綁定僅供記錄；此整合不會操作開關。",
+        "data": {
+          "zone_name": "區域名稱",
+          "tank_name": "水箱名稱",
+          "level_sensor": "液位感測器",
+          "refill_switch": "補水開關（選填）",
+          "alarm_switch": "警報開關（選填）"
+        },
+        "data_description": {
+          "level_sensor": "請選擇以公尺（m）、公分（cm）或毫米（mm）回報水位的感測器。未登錄的感測器僅依實體 ID 追蹤，無法偵測使用相同 ID 的其他未登錄感測器。"
+        }
+      }
+    },
+    "error": {
+      "blank_name": "請輸入名稱。",
+      "invalid_sensor": "請選擇感測器實體。",
+      "invalid_switch": "請選擇開關實體，或將此欄位留空。",
+      "own_level_sensor": "請選擇來源感測器，勿選擇由此整合建立的水位感測器。",
+      "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
+    },
+    "abort": {
+      "already_configured": "水位控制器已設定。請使用「設定」管理區域與水箱。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "管理水位監測清單",
+        "menu_options": {
+          "add_zone": "新增區域", "edit_zone": "重新命名區域", "remove_zone": "移除區域",
+          "add_tank": "新增水箱", "edit_tank": "編輯水箱", "remove_tank": "移除水箱"
+        }
+      },
+      "add_zone": {
+        "title": "新增區域及其第一個水箱",
+        "description": "開關綁定為選填，且此整合不會操作開關。",
+        "data": {
+          "zone_name": "區域名稱", "tank_name": "水箱名稱", "level_sensor": "液位感測器",
+          "refill_switch": "補水開關（選填）", "alarm_switch": "警報開關（選填）"
+        }
+      },
+      "select_target": {
+        "title": "選擇區域或水箱",
+        "data": {"zone_id": "區域", "tank_id": "水箱"}
+      },
+      "rename_zone": {
+        "title": "重新命名區域",
+        "data": {"zone_name": "區域名稱"}
+      },
+      "save_tank": {
+        "title": "水箱設定",
+        "description": "已選擇：{target}。請選擇以公尺（m）、公分（cm）或毫米（mm）回報水位的感測器。開關綁定為選填，且此整合不會操作開關。",
+        "data": {
+          "tank_name": "水箱名稱", "level_sensor": "液位感測器",
+          "refill_switch": "補水開關（選填）", "alarm_switch": "警報開關（選填）"
+        },
+        "data_description": {
+          "level_sensor": "已登錄的感測器重新命名後仍可追蹤。若綁定已遺失或先前只儲存實體 ID，請重新選擇要綁定的已登錄感測器。使用相同實體 ID 的未登錄感測器無法彼此區分。"
+        }
+      },
+      "confirm_remove": {
+        "title": "確認移除",
+        "description": "確定要移除 {target} 嗎？移除區域時，該區域的所有水箱也會從此整合移除。來源感測器與開關不會變更。",
+        "data": {"confirm": "是，移除所選項目"}
+      }
+    },
+    "error": {
+      "blank_name": "請輸入名稱。",
+      "invalid_sensor": "請選擇感測器實體。",
+      "invalid_switch": "請選擇開關實體，或將此欄位留空。",
+      "own_level_sensor": "請選擇來源感測器，勿選擇由此整合建立的水位感測器。",
+      "confirm_required": "請開啟確認選項，才能移除所選項目。",
+      "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
+    },
+    "abort": {
+      "configuration_changed": "此表單開啟後，設定已變更。請重新開啟「設定」並再試一次。",
+      "invalid_target": "所選區域或水箱不存在。",
+      "minimum_zones": "控制器必須至少包含一個區域。",
+      "minimum_tanks": "每個區域必須至少包含一個水箱。若要移除整個區域，請使用「移除區域」。"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "tank_level": {"name": "{zone} · {tank} 水位"}
+    }
+  }
+}
