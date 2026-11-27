@@ -108,6 +108,117 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
             while not (state := self.hass.states.get(entity_id)) or state.state != expected:
                 await asyncio.sleep(0.01)
 
+    async def test_scale_save_preserves_manual_fault_and_in_progress_alarm(self):
+        from homeassistant.helpers.entity_platform import async_get_platforms
+
+        output = self.registry.async_get_or_create("switch", "p4_synthetic", "scale_guard").entity_id
+        self.hass.states.async_set(output, "off")
+
+        @callback
+        def confirmed_off(call):
+            self.calls.append(call)
+            self.assertEqual(call.data["entity_id"], output)
+            self.hass.states.async_set(output, "off")
+
+        self.hass.services.async_register("switch", "turn_off", confirmed_off)
+        await self.save(await self.select("edit_tank", tank_id=self.tank),
+                        tank_name="Storage", level_sensor=self.probe, refill_switch=output,
+                        commission_refill=True, confirm_device_cutoff=True)
+        await self.save(await self.thresholds(), **REFILL, alarm_lower_m=1, alarm_delay_seconds=3)
+        owner = self.entry.runtime_data
+        options = self.entry.options
+        level = self.registry.async_get_entity_id("sensor", DOMAIN, self.tank)
+        status_id = self.entity("sensor", "refill_status")
+        alarm_id = self.entity("binary_sensor", "low_level_alarm")
+        alarm_platform = next(platform for platform in async_get_platforms(self.hass, DOMAIN)
+                              if alarm_id in platform.entities)
+        alarm = alarm_platform.entities[alarm_id]
+        status = lambda: self.hass.states.get(status_id).attributes["uninus_water_manual"]
+        self.assertTrue(status()["can_start"])
+        self.hass.states.async_set(output, "on")
+        await self.wait_for_state(output, "off")
+        await self.hass.async_block_till_done()
+        self.assertEqual(status()["fault"], "unexpected_on")
+        self.assertFalse(status()["can_start"])
+        self.assertEqual(self.hass.states.get(output).state, "off")
+        calls = self.calls.copy()
+        self.assertEqual(len(calls), 1)
+
+        form = await self.select("edit_display_scale", tank_id=self.tank)
+        self.set_depth("0.5")
+        await self.hass.async_block_till_done()
+        interval, timer = alarm._interval, alarm._cancel_timer
+        self.assertIsNotNone(interval)
+        self.assertIsNotNone(timer)
+        self.assert_state(alarm_id, "off")
+        await self.save(form, scale_max_m=2.5)
+        self.assertEqual(status()["fault"], "unexpected_on", status())
+        self.assertFalse(status()["can_start"])
+        self.assertIs(self.entry.runtime_data, owner)
+        self.assertIs(self.entry.options, options)
+        self.assertIs(alarm_platform.entities[alarm_id], alarm)
+        self.assertIs(alarm._interval, interval)
+        self.assertIs(alarm._cancel_timer, timer)
+        self.assertEqual(self.hass.states.get(level).attributes["uninus_water_display"]["scale_max_m"], 2.5)
+        async with asyncio.timeout(4):
+            while self.hass.states.get(alarm_id).state != "on":
+                await asyncio.sleep(0.01)
+        self.assertEqual(self.calls, calls)
+
+        entry_id = self.entry.entry_id
+        await self.hass.async_stop()
+        await self.boot()
+        self.entry = self.hass.config_entries.async_get_entry(entry_id)
+        self.assertTrue(await self.hass.config_entries.async_setup(entry_id))
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.registry.async_get_entity_id("sensor", DOMAIN, self.tank), level)
+        self.assertEqual(self.hass.states.get(level).attributes["uninus_water_display"]["scale_max_m"], 2.5)
+
+    async def test_display_scale_is_independent_of_thresholds_and_projects_on_level_only(self):
+        await self.save(await self.thresholds(), **REFILL, **ALARM)
+        level = self.registry.async_get_entity_id("sensor", DOMAIN, self.tank)
+        form = await self.select("edit_display_scale", tank_id=self.tank)
+        rejected = await self.submit(form, scale_max_m=0)
+        self.assertEqual(rejected["errors"], {"scale_max_m": "positive_display_scale"})
+        await self.save(rejected, scale_max_m=2.5)
+        tank = self.entry.options["zones"][0]["tanks"][0]
+        self.assertEqual(self.entry.data["display_scales_m"], {self.tank: 2.5})
+        self.assertEqual(tank["thresholds"], REFILL | ALARM)
+        self.assertEqual(self.hass.states.get(level).attributes["uninus_water_display"], {
+            "version": 1, "scale_max_m": 2.5,
+            "refill": (REFILL["refill_lower_m"], REFILL["refill_upper_m"]),
+            "alarm": (ALARM["alarm_lower_m"], ALARM["alarm_delay_seconds"]),
+        })
+        self.set_depth("unavailable")
+        await self.hass.async_block_till_done()
+        self.assertEqual(self.hass.states.get(level).attributes["uninus_water_display"]["scale_max_m"], 2.5)
+        await self.save(await self.select("edit_display_scale", tank_id=self.tank))
+        self.assertNotIn("display_scales_m", self.entry.data)
+        self.assertEqual(self.entry.options["zones"][0]["tanks"][0]["thresholds"], REFILL | ALARM)
+        self.assertFalse(self.calls)
+
+    async def test_display_scale_and_unrelated_options_keep_native_stale_cas_and_reload(self):
+        owner = self.entry.runtime_data
+        options = self.entry.options
+        stale_rename = await self.select("edit_zone", zone_id=self.zone["id"])
+        first_scale = await self.select("edit_display_scale", tank_id=self.tank)
+        stale_scale = await self.select("edit_display_scale", tank_id=self.tank)
+        await self.save(first_scale, scale_max_m=2.5)
+        self.assertIs(self.entry.runtime_data, owner)
+        self.assertIs(self.entry.options, options)
+        for draft, fields in ((stale_rename, {"zone_name": "Stale"}),
+                              (stale_scale, {"scale_max_m": 8})):
+            result = await self.submit(draft, **fields)
+            self.assertEqual((result["type"], result["reason"]), (FlowResultType.ABORT, "configuration_changed"))
+        stale_scale = await self.select("edit_display_scale", tank_id=self.tank)
+        await self.save(await self.select("edit_zone", zone_id=self.zone["id"]), zone_name="Renamed")
+        self.assertIsNot(self.entry.runtime_data, owner)
+        result = await self.submit(stale_scale, scale_max_m=8)
+        self.assertEqual((result["type"], result["reason"]), (FlowResultType.ABORT, "configuration_changed"))
+        self.assertEqual(self.entry.options["zones"][0]["name"], "Renamed")
+        self.assertEqual(self.entry.data["display_scales_m"], {self.tank: 2.5})
+        self.assertFalse(self.calls)
+
     async def test_native_refill_preview_persists_and_compares_both_inclusive_bounds(self):
         self.assertIsNone(self.entity("sensor", "refill_preview"))
         self.assertIsNone(self.entity("binary_sensor", "low_level_alarm"))

@@ -34,7 +34,7 @@
         "menu_options": {
           "add_zone": "新增區域", "edit_zone": "重新命名區域", "remove_zone": "移除區域",
           "add_tank": "新增水箱", "edit_tank": "編輯水箱", "remove_tank": "移除水箱",
-          "edit_thresholds": "編輯門檻預覽"
+          "edit_thresholds": "編輯門檻預覽", "edit_display_scale": "編輯水位顯示量程"
         }
       },
       "add_zone": {
@@ -70,6 +70,11 @@
           "confirm_device_cutoff": "請實地確認輸出對應，並確認沒有其他控制器操作同一輸出。每個啟用的裝置都必須能在不依賴 Home Assistant 或網路的情況下安全關斷。勾選不代表已測試硬體；若無法驗證，請勿啟用。"
         }
       },
+      "save_display_scale": {
+        "title": "水位顯示量程",
+        "description": "設定 {target} 由零起算的顯示上限。留空可移除量程；此設定不是容量、門檻或控制設定。",
+        "data": {"scale_max_m": "顯示量程上限"}
+      },
       "save_thresholds": {
         "title": "唯讀門檻預覽",
         "description": "已選擇：{target}。每項功能請填寫兩個欄位；兩欄都留空即停用該功能。此預覽不操作開關，也不傳送通知。",
@@ -103,6 +108,7 @@
       "finite_threshold_required": "請輸入有限數值。",
       "threshold_pair_required": "請填寫該功能的兩個欄位，或將兩欄都清空以停用。",
       "threshold_order": "停止上限必須高於補水下限。",
+      "positive_display_scale": "請輸入大於零的有限數值，或留空。",
       "positive_whole_delay": "請輸入至少 1 秒的整數。",
       "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
     },

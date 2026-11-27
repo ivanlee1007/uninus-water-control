@@ -6,16 +6,17 @@ from math import isfinite
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import SIGNAL_CONFIG_ENTRY_CHANGED, ConfigEntry, ConfigEntryChange, ConfigEntryState
 from homeassistant.const import ATTR_UNIT_OF_MEASUREMENT, EVENT_STATE_CHANGED, UnitOfLength
 from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, State, callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util.unit_conversion import DistanceConverter
 
-from .inventory import Tank, Zone, inventory, level_source
+from .inventory import DISPLAY_SCALES, Tank, Zone, inventory, level_source
 
 LEVEL_UNITS = (UnitOfLength.METERS, UnitOfLength.CENTIMETERS, UnitOfLength.MILLIMETERS)
 _METRE_SHIFTS = {
@@ -28,7 +29,7 @@ async def async_setup_entry(
 ) -> None:
     """Expose level and any configured read-only previews."""
     async_add_entities(
-        TankLevel(zone, tank, zone_index, tank_index)
+        TankLevel(entry, zone, tank, zone_index, tank_index)
         for zone_index, zone in enumerate(inventory(entry))
         for tank_index, tank in enumerate(zone["tanks"])
     )
@@ -78,8 +79,9 @@ class TankLevel(SensorEntity):
     _attr_native_value = None
     _attr_available = False
 
-    def __init__(self, zone: Zone, tank: Tank, zone_index: int, tank_index: int) -> None:
+    def __init__(self, entry: ConfigEntry, zone: Zone, tank: Tank, zone_index: int, tank_index: int) -> None:
         """Bind one stable tank identity to its configured source."""
+        self._entry = entry
         self._attr_unique_id = tank["id"]
         self._attr_translation_placeholders = {"zone": zone["name"], "tank": tank["name"]}
         self._attr_extra_state_attributes = {
@@ -89,6 +91,17 @@ class TankLevel(SensorEntity):
                 "tank": {"id": tank["id"], "name": tank["name"], "index": tank_index},
             }
         }
+        display = {"version": 1}
+        thresholds = tank.get("thresholds", {})
+        for name, first, second in (
+            ("refill", "refill_lower_m", "refill_upper_m"),
+            ("alarm", "alarm_lower_m", "alarm_delay_seconds"),
+        ):
+            if first in thresholds and second in thresholds:
+                display[name] = (thresholds[first], thresholds[second])
+        if len(display) > 1:
+            self._attr_extra_state_attributes["uninus_water_display"] = display
+        self._refresh_display_scale()
         self._tank = tank
         self._source: str | None = None
         self._unsub_source: CALLBACK_TYPE | None = None
@@ -100,9 +113,34 @@ class TankLevel(SensorEntity):
 
     async def async_added_to_hass(self) -> None:
         """Subscribe and read the initial state without an intervening yield."""
+        self.async_on_remove(async_dispatcher_connect(self.hass, SIGNAL_CONFIG_ENTRY_CHANGED, self._async_entry_changed))
         self.async_on_remove(self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._async_registry_changed))
         self.async_on_remove(self._async_clear_source)
         self._async_refresh_source(level_source(er.async_get(self.hass), self._tank))
+
+    def _refresh_display_scale(self) -> bool:
+        """Change only the display maximum, without observing the source again."""
+        key = "uninus_water_display"
+        old = self._attr_extra_state_attributes.get(key, {"version": 1})
+        value = self._entry.data.get(DISPLAY_SCALES, {}).get(self._attr_unique_id)
+        if value == old.get("scale_max_m"):
+            return False
+        display = dict(old)
+        if value is None:
+            display.pop("scale_max_m", None)
+        else:
+            display["scale_max_m"] = value
+        if len(display) > 1:
+            self._attr_extra_state_attributes[key] = display
+        else:
+            self._attr_extra_state_attributes.pop(key, None)
+        return True
+
+    @callback
+    def _async_entry_changed(self, change: ConfigEntryChange, entry: ConfigEntry) -> None:
+        if (change is ConfigEntryChange.UPDATED and entry is self._entry
+                and entry.state is ConfigEntryState.LOADED and self._refresh_display_scale()):
+            self.async_write_ha_state()
 
     @callback
     def _async_clear_source(self) -> None:

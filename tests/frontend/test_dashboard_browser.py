@@ -1,4 +1,4 @@
-"""Chromium geometry and lifecycle of the shipped shell with controlled card helpers.
+"""Chromium geometry and lifecycle of the shipped console with controlled HA state.
 
 Not a native Home Assistant frontend test. Run explicitly under tests/frontend
 with pytest, playwright==1.56.0 and `python -m playwright install chromium`.
@@ -31,75 +31,18 @@ def browser_page():
         page.on("pageerror", lambda error: failures.append(str(error)))
         page.on("request", lambda request: network.append(request.url))
         page.route("**/*", lambda route: route.abort())
-        page.set_content("""<style>
-            body { background: var(--primary-background-color); color: var(--primary-text-color);
-                   font: 16px system-ui; }
-            #area { width: 300px; }
-            .dark { --primary-background-color: #14191e; --primary-text-color: #eee;
-                    --fixture-tile-surface: #2e3740; }
-            p, h2 { margin: 0; }
-            fixture-heading { display: block; font-size: 20px; font-weight: 600; }
-            fixture-tile button { display: block; width: 100%; min-height: 56px;
-                  border: 1px solid #888; border-radius: 12px; color: inherit;
-                  background: var(--fixture-tile-surface, #ecf3fa); text-align: start;
-                  overflow-wrap: anywhere; }
-            fixture-tile button + button { min-height: 0; }
-        </style><main id="area"></main>""")
+        page.set_content('<style>#area { width: 300px; }</style><main id="area"></main>')
         page.evaluate("""() => {
-            window.activity = {loads: 0, cards: [], config: 0, routes: [], events: []};
+            window.activity = {loads: 0, routes: [], events: []};
             for (const name of ['hass-more-info', 'config-changed', 'call-service']) {
                 document.addEventListener(name, (e) => activity.events.push([name, e.detail]));
             }
-            class Heading extends HTMLElement {
-                setConfig(config) { activity.config++; this.config = config; this.textContent = config.heading; }
-            }
-            class Tile extends HTMLElement {
-                constructor() {
-                    super();
-                    this.attachShadow({mode: 'open'});
-                    const style = document.createElement('style');
-                    style.textContent = `:host { display:block } button {
-                        width: 100%; min-height: 44px; border-radius: 12px; color: inherit;
-                        font: inherit; font-size: 14px; overflow-wrap: anywhere; text-align: start;
-                        border: 1px solid #888; background: var(--fixture-tile-surface, #ecf3fa); }
-                        .icon { min-height: 20px; margin-top: 2px; font-size: 12px; }`;
-                    this.shadowRoot.append(style);
-                    for (const [part, action] of [['body', 'tap_action'], ['icon', 'icon_tap_action']]) {
-                        const button = document.createElement('button');
-                        button.className = part;
-                        button.addEventListener('click', () => {
-                            if (this.config[action]?.action === 'more-info') {
-                                button.dispatchEvent(new CustomEvent('hass-more-info', {
-                                    detail: {entityId: this.config.entity}, bubbles: true, composed: true,
-                                }));
-                            }
-                        });
-                        this.shadowRoot.append(button);
-                    }
-                    this.shadowRoot.querySelector('.icon').textContent = 'More info';
-                }
-                setConfig(config) { activity.config++; this.config = config; this.render(); }
-                set hass(value) { this.latest = value; this.render(); }
-                render() {
-                    if (!this.config || !this.latest) return;
-                    const reading = this.latest.states[this.config.entity]?.state;
-                    this.shadowRoot.querySelector('.body').textContent = `${this.config.name} · ${reading}`;
-                }
-            }
-            customElements.define('fixture-heading', Heading);
-            customElements.define('fixture-tile', Tile);
-            window.helpers = {createCardElement(config) {
-                activity.cards.push(config);
-                const card = document.createElement(`fixture-${config.type}`);
-                card.setConfig(config);
-                return card;
-            }};
-            window.loadCardHelpers = async () => { activity.loads++; return helpers; };
+            window.loadCardHelpers = async () => { activity.loads++; throw new Error('unexpected helper'); };
             window.id = (n) => n.toString(16).padStart(32, '0');
             window.projection = (tank, zone = 1, index = tank - 1, zoneIndex = zone - 1) => ({
                 state: tank === 2 ? 'unavailable' : String(tank * 10),
                 attributes: {
-                    friendly_name: 'DO NOT USE RAW NAME',
+                    unit_of_measurement: 'm', friendly_name: 'DO NOT USE RAW NAME',
                     uninus_water_dashboard: {
                         version: 1, zone: {id: id(zone), name: 'Water zone', index: zoneIndex},
                         tank: {id: id(tank), name: 'Tank ' + tank, index},
@@ -113,6 +56,8 @@ def browser_page():
                 fetchWithAuth: (...args) => activity.routes.push(['fetch', args]),
             });
         }""")
+
+
         # The new module is absent at the P1 baseline: assert visible behavior instead
         # of using file absence or undefined registration as the RED assertion.
         if DASHBOARD.is_file():
@@ -133,15 +78,15 @@ def test_native_card_contract_and_container_geometry(browser_page):
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
     }""")
-    tiles = page.locator("fixture-tile")
+    tiles = page.locator(".tank")
     try:
         tiles.first.wait_for()
     except playwright.TimeoutError:
         pass
-    assert tiles.count() == 5, "five native tile slots must be created from hass.states"
-    assert page.locator("fixture-heading").all_text_contents() == ["Water zone"]
-    assert page.locator("fixture-tile .body").all_text_contents() == [
-        "Tank 1 · 10", "Tank 2 · unavailable", "Tank 3 · 30", "Tank 4 · 40", "Tank 5 · 50"
+    assert tiles.count() == 5, "five tank slots must be created from hass.states"
+    assert page.locator(".zone-head h2").all_text_contents() == ["Water zone"]
+    assert page.locator(".level").evaluate_all("els => els.map(el => el.getAttribute('aria-label'))") == [
+        "Tank 1 · 10.00 m", "Tank 2 · 液位讀值不可用", "Tank 3 · 30.00 m", "Tank 4 · 40.00 m", "Tank 5 · 50.00 m"
     ]
     assert page.evaluate("""() => ({
         stub: card.constructor.getStubConfig(), grid: card.getGridOptions(),
@@ -151,14 +96,7 @@ def test_native_card_contract_and_container_geometry(browser_page):
         "grid": {"columns": "full", "rows": "auto", "min_columns": 3},
         "count": 1,
     }
-    assert page.evaluate("activity.cards") == [
-        {"type": "heading", "heading": "Water zone"},
-        *[
-            {"type": "tile", "entity": f"sensor.p{n}", "name": f"Tank {n}",
-             "tap_action": {"action": "more-info"}, "icon_tap_action": {"action": "more-info"}}
-            for n in range(1, 6)
-        ],
-    ]
+    assert page.evaluate("activity.loads") == 0
     evidence = []
     evidence_dir = os.environ.get("P2_BROWSER_EVIDENCE")
 
@@ -171,7 +109,7 @@ def test_native_card_contract_and_container_geometry(browser_page):
                 return {x, y, width, height, right, overflow: node.scrollWidth - node.clientWidth};
             };
             return {viewport: innerWidth, card: rect(card), zones: zoneHosts.map(rect),
-                tiles: [...zoneHosts[0].querySelectorAll('fixture-tile')].map(rect)};
+                tiles: [...zoneHosts[0].querySelectorAll('.tank')].map(rect)};
         }""")
         assert geometry["viewport"] == 1100
         assert geometry["card"]["width"] == width
@@ -192,16 +130,164 @@ def test_native_card_contract_and_container_geometry(browser_page):
         if evidence_dir and width in (300, 692):
             page.locator("#area").screenshot(path=Path(evidence_dir) / f"shell-light-{width}.png")
     page.evaluate("""() => {
-        document.body.classList.add('dark');
-        card.hass = snapshot({...states, 'sensor.p6': projection(6, 2, 0)});
+        card.hass = {...snapshot({...states, 'sensor.p6': projection(6, 2, 0)}), themes: {darkMode: true}};
     }""")
-    page.locator("fixture-tile").nth(5).wait_for()
+    page.locator(".tank").nth(5).wait_for()
     measure(690, 4)
-    measure(720, 2, 2)
+    measure(740, 2, 2)
     if evidence_dir:
         directory = Path(evidence_dir)
-        page.locator("#area").screenshot(path=directory / "shell-dark-720.png")
+        page.locator("#area").screenshot(path=directory / "shell-dark-740.png")
         (directory / "geometry.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+
+
+def test_overview_summarizes_per_tank_previews_without_inventing_scale_or_output(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        const preview = (entity_id, kind, state, tank) => ({entity_id, state,
+            attributes: {uninus_water_thresholds: {version: 1, zone_id: id(1), tank_id: id(tank), kind}}});
+        window.states = {
+            'sensor.p1': projection(1), 'sensor.p2': projection(2), 'sensor.p3': projection(3),
+            'sensor.band': preview('sensor.band', 'refill_preview', 'stop_threshold', 1),
+            'binary_sensor.low': preview('binary_sensor.low', 'low_level_alarm', 'on', 1),
+            'binary_sensor.unknown': preview('binary_sensor.unknown', 'low_level_alarm', 'unavailable', 2),
+        };
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = {...snapshot(states, 'zh-Hant'), user: {is_admin: true}};
+        document.querySelector('#area').append(card);
+    }""")
+    page.locator(".tank").first.wait_for()
+    assert page.get_by_role("heading", name="補水控制", exact=True).is_visible()
+    assert page.get_by_text("1 區 · 3 桶 · 水位單位 m", exact=True).is_visible()
+    assert page.get_by_text("無告警輸出回報", exact=True).is_visible()
+    assert page.locator("[data-low-level-active]").count() == 1
+    assert page.get_by_role("meter").count() == 0
+    first = page.locator(".tank").first
+    first.locator(".diagnostics-toggle").click()
+    assert first.get_by_role("button", name="低液位告警中", exact=True).is_visible()
+    assert first.get_by_text("告警輸出：未提供", exact=True).is_visible()
+    assert first.get_by_role("button", name="開啟告警", exact=True).is_disabled()
+    assert first.get_by_text("未設定水位量程", exact=True).is_visible()
+    page.get_by_role("button", name="補水參數", exact=True).click()
+    assert page.get_by_role("link", name="前往整合設定：門檻與量程").get_attribute("href") == (
+        "/config/integrations/integration/uninus_water_control"
+    )
+    page.evaluate("""() => {
+        states['binary_sensor.low'] = {...states['binary_sensor.low'], state: 'off'};
+        card.hass = {...snapshot(states, 'en'), user: {is_admin: false}};
+    }""")
+    assert page.get_by_role("link").count() == 0
+    page.get_by_role("button", name="操作總覽", exact=True).click()
+    assert page.locator("[data-low-level-active]").count() == 0
+    assert first.get_by_role("button", name="低液位告警未觸發", exact=True).is_visible()
+
+
+def test_reference_inventory_fits_three_tanks_per_zone_at_desktop_width(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        const states = Object.fromEntries(Array.from({length: 8}, (_, i) =>
+            [`sensor.p${i}`, projection(i + 1, i < 4 ? 1 : 2, i % 4)]));
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = snapshot(states);
+        document.querySelector('#area').append(card);
+    }""")
+    page.locator(".tank").last.wait_for()
+    for width, expected in ((984, 3), (1030, 3), (1060, 3), (390, 2)):
+        rows = page.evaluate("""width => {
+            document.querySelector('#area').style.width = `${width}px`;
+            return [...card.shadowRoot.querySelectorAll('.zone')].map(zone => {
+                const bounds = [...zone.querySelectorAll('.tank')].map(tank => tank.getBoundingClientRect());
+                return bounds.filter(box => box.top === bounds[0].top).length;
+            });
+        }""", width)
+        assert rows == [expected, expected], (width, rows)
+
+
+def test_calibrated_level_and_threshold_summary_follow_current_projection(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        window.update = (reading, extras = {}) => {
+            const entity = 'sensor.p1';
+            const level = projection(1);
+            level.state = reading;
+            level.entity_id = entity;
+            Object.assign(level.attributes, {unit_of_measurement: 'm', uninus_water_display: {
+                version: 1, scale_max_m: 2.5, refill: [0.5, 1.5], alarm: [0.4, 5], ...extras,
+            }});
+            card.hass = snapshot({[entity]: level});
+        };
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        update('2.5');
+        document.querySelector('#area').append(card);
+    }""")
+    meter = page.get_by_role("meter")
+    meter.wait_for()
+    assert meter.get_attribute("aria-valuenow") == "2.5"
+    assert meter.get_attribute("aria-valuemax") == "2.5"
+    assert page.get_by_text("補水門檻　0.5／1.5 m", exact=True).is_visible()
+    assert page.get_by_text("低液位告警　≤ 0.4 m · 5 秒", exact=True).is_visible()
+    assert page.get_by_text("超出顯示量程", exact=True).count() == 0
+    page.evaluate("update('2.51')")
+    assert meter.get_attribute("aria-valuenow") == "2.5"
+    assert page.get_by_text("超出顯示量程", exact=True).is_visible()
+    page.evaluate("update('-0.01')")
+    assert meter.get_attribute("aria-valuenow") == "0"
+    page.evaluate("update('unavailable')")
+    assert meter.count() == 0
+    assert page.locator(".relation").get_by_text("液位讀值不可用", exact=True).is_visible()
+    page.evaluate("update('1', {refill: [1.5, 0.5], version: 2})")
+    assert meter.count() == 0
+    assert page.get_by_text("補水門檻　0.5／1.5 m", exact=True).count() == 0
+
+
+def test_mixed_thresholds_stay_on_their_own_validated_tanks(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        const states = {};
+        for (let i = 1; i <= 3; i++) {
+            const entity = `sensor.p${i}`;
+            const level = projection(i);
+            level.entity_id = i === 3 ? 'sensor.mismatched' : entity;
+            level.attributes.uninus_water_display = {version: 1, refill: [i, i + 1], alarm: [i, 5]};
+            states[entity] = level;
+        }
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = snapshot(states);
+        document.querySelector('#area').append(card);
+    }""")
+    page.get_by_text("各桶補水門檻不同", exact=True).wait_for()
+    assert page.get_by_text("各桶低液位告警設定不同", exact=True).is_visible()
+    for i in (1, 2):
+        tank = page.locator(f'[data-tank-id="{i:032x}"]')
+        tank.locator(".diagnostics-toggle").click()
+        assert tank.get_by_role("button", name="補水預覽無法取得", exact=True).is_disabled()
+        assert tank.get_by_role("button", name="低液位告警預覽無法取得", exact=True).is_disabled()
+    page.get_by_role("button", name="補水參數", exact=True).click()
+    for i in (1, 2):
+        assert page.get_by_text(f"補水門檻　{i}／{i+1} m", exact=True).is_visible()
+        assert page.get_by_text(f"低液位告警　≤ {i} m · 5 秒", exact=True).is_visible()
+    assert not page.get_by_text("補水門檻　3／4 m", exact=True).count()
+
+
+def test_tank_readout_uses_a_vessel_without_claiming_a_measured_scale(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = snapshot({'sensor.p1': projection(1)});
+        document.querySelector('#area').append(card);
+    }""")
+    readout = page.get_by_role("button", name="Tank 1 · 10.00 m", exact=True)
+    readout.wait_for()
+    page.locator(".tank .diagnostics-toggle").click()
+    assert page.get_by_text("未設定水位量程", exact=True).is_visible()
+    assert page.get_by_role("meter").count() == 0
+    readout.click()
+    assert page.evaluate("activity.events") == [["hass-more-info", {"entityId": "sensor.p1"}]]
 
 
 def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_page):
@@ -224,32 +310,32 @@ def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_pa
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
     }""")
-    page.locator("fixture-tile").first.wait_for()
+    page.locator(".tank").first.wait_for()
     first = page.locator('[data-tank-id="00000000000000000000000000000001"]')
     second = page.locator('[data-tank-id="00000000000000000000000000000002"]')
     refill = first.locator('[data-preview-kind="refill_preview"]')
     alarm = first.locator('[data-preview-kind="low_level_alarm"]')
-    assert first.locator("fixture-tile").count() == 3, "configured tank needs two read-only native tiles"
-    assert second.locator("fixture-tile").count() == 1
-    assert refill.locator(".body").inner_text() == "Refill threshold preview · refill_threshold"
-    assert alarm.locator(".body").inner_text() == "Alarm preview · off"
-    first.locator("fixture-tile .body").first.focus()
-    page.keyboard.press("Tab")
+    assert first.locator("[data-preview-kind]").count() == 2
+    assert second.locator("[data-preview-kind]").count() == 0
+    first.locator(".diagnostics-toggle").click()
+    assert refill.inner_text() == "↓ 達補水低門檻"
+    assert alarm.inner_text() == "低液位告警未觸發"
     page.keyboard.press("Tab")
     old = refill.element_handle()
-    assert refill.evaluate("el => el.shadowRoot.activeElement === el.shadowRoot.querySelector('.body')")
+    refill.focus()
     page.evaluate("""() => {
-        window.configBeforePreviewPush = activity.config;
+        window.previewBlurs = 0;
+        card.shadowRoot.activeElement.addEventListener('blur', () => previewBlurs++);
         states['sensor.renamed_one'] = {...states['sensor.renamed_one'], state: 'stop_threshold'};
         states['binary_sensor.renamed_two'] = {...states['binary_sensor.renamed_two'], state: 'unavailable'};
         card.hass = snapshot({...states});
     }""")
-    assert refill.evaluate("(el, old) => el === old && el.shadowRoot.activeElement.className === 'body'", old)
-    assert page.evaluate("activity.config === configBeforePreviewPush")
-    assert "stop_threshold" in refill.locator(".body").inner_text()
-    assert "unavailable" in alarm.locator(".body").inner_text()
-    refill.locator(".body").click()
-    alarm.locator(".icon").click()
+    assert refill.evaluate("(el, old) => el === old && el.getRootNode().activeElement === el", old)
+    assert page.evaluate("previewBlurs") == 0
+    assert refill.inner_text() == "↑ 達補水高門檻"
+    assert alarm.inner_text() == "低液位告警預覽無法取得"
+    refill.click()
+    alarm.click()
     assert page.evaluate("activity.events") == [
         ["hass-more-info", {"entityId": "sensor.renamed_one"}],
         ["hass-more-info", {"entityId": "binary_sensor.renamed_two"}],
@@ -265,7 +351,7 @@ def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_pa
     }""")
     assert refill.count() == 0
     assert alarm.count() == 1
-    assert second.locator("fixture-tile").count() == 1
+    assert second.locator("[data-preview-kind]").count() == 0
     page.evaluate("""() => {
         const withoutExtra = {...states};
         delete withoutExtra['binary_sensor.extra_key'];
@@ -274,9 +360,9 @@ def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_pa
             'binary_sensor.mismatched_key': preview('binary_sensor.different_entity_id', 'low_level_alarm', 'on', 2, 2),
         }, 'zh-TW');
     }""")
-    assert refill.locator(".body").inner_text() == "補水門檻預覽 · stop_threshold"
-    assert alarm.locator(".body").inner_text() == "低液位告警預覽 · unavailable"
-    assert second.locator("fixture-tile").count() == 1
+    assert refill.inner_text() == "↑ 達補水高門檻"
+    assert alarm.inner_text() == "低液位告警預覽無法取得"
+    assert second.locator("[data-preview-kind]").count() == 0
 
 
 def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
@@ -289,27 +375,24 @@ def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
         card.hass = snapshot(states);
         card.setConfig({type: 'custom:uninus-water-dashboard'});
     }""")
-    page.locator("fixture-tile .body").first.wait_for()
+    page.get_by_role("button", name="區域與水桶", exact=True).focus()
+    page.keyboard.press("Tab")
     page.keyboard.press("Tab")
     page.evaluate("""() => {
-        window.tile = card.shadowRoot.querySelector('fixture-tile');
-        window.body = tile.shadowRoot.querySelector('.body');
+        window.level = card.shadowRoot.querySelector('.level');
         window.zone = card.shadowRoot.querySelector('[data-zone-id]');
-        window.heading = zone.querySelector('fixture-heading');
+        window.heading = zone.querySelector('.zone-head h2');
         window.blurCount = 0;
-        body.addEventListener('blur', () => blurCount++);
-        window.beforeConfig = activity.config;
+        level.addEventListener('blur', () => blurCount++);
     }""")
-    assert page.evaluate("tile.shadowRoot.activeElement === body")
+    assert page.evaluate("card.shadowRoot.activeElement === level")
     page.evaluate("""() => {
         states = {...states, 'sensor.p1': {...states['sensor.p1'], state: '59'}};
-        window.latest = snapshot(states);
-        card.hass = latest;
+        card.hass = snapshot(states);
         card.setConfig({...card.constructor.getStubConfig(), grid_options: {columns: 'full'}});
     }""")
-    page.get_by_role("button", name="Tank 1 · 59").wait_for()
-    assert page.evaluate("card.shadowRoot.querySelector('fixture-tile') === tile"), "live telemetry must retain native Tile"
-    assert page.evaluate("activity.config === beforeConfig && activity.loads === 1")
+    page.get_by_role("button", name="Tank 1 · 59.00 m").wait_for()
+    assert page.evaluate("card.shadowRoot.querySelector('.level') === level && activity.loads === 0")
     page.evaluate("""() => {
         const next = structuredClone(states);
         for (const key of ['sensor.p1', 'sensor.p2']) {
@@ -325,20 +408,19 @@ def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
         window.latest = snapshot(next);
         card.hass = latest;
     }""")
-    page.get_by_role("button", name="<img src=/bad> 水桶 · 59").wait_for()
-    assert page.locator("fixture-heading").all_text_contents() == ["Water zone", "<b>同名</b>"]
-    assert page.locator("fixture-tile .body").all_text_contents() == [
-        "Tank 3 · 30", "Tank 4 · 40", "<img src=/bad> 水桶 · 59"
+    page.get_by_role("button", name="<img src=/bad> 水桶 · 59.00 m").wait_for()
+    assert page.locator(".zone-head h2").all_text_contents() == ["Water zone", "<b>同名</b>"]
+    assert page.locator(".level").evaluate_all("els => els.map(el => el.getAttribute('aria-label'))") == [
+        "Tank 3 · 30.00 m", "Tank 4 · 40.00 m", "<img src=/bad> 水桶 · 59.00 m"
     ]
     assert page.evaluate("""() =>
         card.shadowRoot.querySelectorAll('[data-zone-id]')[1] === zone &&
-        zone.querySelector('fixture-heading') === heading &&
-        zone.querySelectorAll('fixture-tile')[1] === tile &&
-        tile.latest === latest && tile.shadowRoot.activeElement === body && blurCount === 0
+        zone.querySelector('.zone-head h2') === heading &&
+        zone.querySelectorAll('.level')[1] === level &&
+        card.shadowRoot.activeElement === level && blurCount === 0
     """)
     page.keyboard.press("Enter")
-    zone_tiles = page.locator(f'[data-zone-id="{1:032x}"] fixture-tile')
-    zone_tiles.nth(1).get_by_role("button", name="More info").click()
+    page.locator(f'[data-zone-id="{1:032x}"] .level').nth(1).click()
     assert page.evaluate("activity.events") == [
         ["hass-more-info", {"entityId": "sensor.p1"}],
         ["hass-more-info", {"entityId": "sensor.p1"}],
@@ -346,72 +428,29 @@ def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
     assert page.locator("img").count() == 0
 
 
-@pytest.mark.parametrize("old_result", ["late-success", "early-rejection"])
-def test_disconnected_helper_flight_cannot_touch_reconnected_card(browser_page, old_result):
+def test_disconnected_card_reads_latest_snapshot_without_ha_helpers(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        window.flights = [];
-        window.loadCardHelpers = () => new Promise((resolve, reject) => flights.push({resolve, reject}));
         window.card = document.createElement('uninus-water-dashboard');
         card.setConfig(card.constructor.getStubConfig());
-        card.hass = snapshot({'sensor.p1': projection(1)});
         document.querySelector('#area').append(card);
     }""")
-    page.wait_for_function("flights.length === 1")
+    assert page.get_by_role("status").inner_text() == "正在載入總覽卡片…"
+    page.evaluate("() => { card.hass = snapshot({}, 'zh-TW'); }")
+    assert page.get_by_role("status").inner_text() == "沒有可顯示的水桶。"
     page.evaluate("""() => {
         card.remove();
         card.hass = snapshot({'sensor.p2': projection(2)});
         document.querySelector('#area').append(card);
         card.hass = snapshot({'sensor.p3': projection(3)});
     }""")
-    page.wait_for_function("flights.length === 2")
-    if old_result == "early-rejection":
-        page.evaluate("""async () => {
-            flights[0].reject(new Error('old private error'));
-            await new Promise(requestAnimationFrame);
-        }""")
-        assert page.get_by_role("status").inner_text() == "Loading dashboard cards…"
-    page.evaluate("""() => { flights[1].resolve(helpers); }""")
-    page.get_by_role("button", name="Tank 3 · 30").wait_for()
-    if old_result == "late-success":
-        page.evaluate("""async () => {
-            flights[0].resolve({createCardElement() { throw new Error('retired helper used'); }});
-            await new Promise(requestAnimationFrame);
-        }""")
-    assert page.locator("fixture-tile .body").all_text_contents() == ["Tank 3 · 30"]
-    assert page.evaluate("activity.cards.length === 2 && flights.length === 2")
-
-
-def test_bridge_notices_are_localized_and_do_not_poll(browser_page):
-    page = browser_page
-    page.evaluate("""() => {
-        window.flights = [];
-        window.loadCardHelpers = () => new Promise((resolve, reject) => flights.push({resolve, reject}));
-        window.card = document.createElement('uninus-water-dashboard');
-        card.setConfig(card.constructor.getStubConfig());
-        document.querySelector('#area').append(card);
-    }""")
-    notice = page.get_by_role("status")
-    assert notice.inner_text() == "Loading dashboard cards…"
-    page.evaluate("() => { card.hass = snapshot({}, 'zh-TW'); }")
-    assert notice.inner_text() == "沒有可顯示的水桶。"
-    assert page.evaluate("flights.length") == 0
-    page.evaluate("() => { card.hass = snapshot({'sensor.p2': projection(2)}, 'zh-Hant'); }")
-    page.wait_for_function("flights.length === 1")
-    assert notice.inner_text() == "正在載入總覽卡片…"
-    page.evaluate("() => { flights[0].reject(new Error('private error')); }")
-    page.get_by_text("無法載入總覽卡片。", exact=True).wait_for()
-    page.evaluate("() => { card.hass = snapshot({'sensor.p2': projection(2)}); }")
-    assert notice.inner_text() == "Dashboard cards could not be loaded."
-    assert page.evaluate("flights.length") == 1
-    page.evaluate("() => { card.remove(); document.querySelector('#area').append(card); }")
-    page.wait_for_function("flights.length === 2")
-    page.evaluate("() => { flights[1].resolve(helpers); }")
-    page.get_by_role("button", name="Tank 2 · unavailable").wait_for()
-    assert notice.count() == 0
+    page.get_by_role("button", name="Tank 3 · 30.00 m").wait_for()
+    assert page.locator(".tank").count() == 1
+    assert page.evaluate("activity.loads") == 0
+    assert page.get_by_text("正在載入總覽卡片…", exact=True).count() == 0
     page.evaluate("() => { card.hass = snapshot({}); }")
-    assert notice.inner_text() == "No tanks to display."
-    assert page.locator("fixture-tile").count() == 0
+    assert page.get_by_role("status").inner_text() == "沒有可顯示的水桶。"
+    assert page.locator(".tank").count() == 0
 
 
 def test_duplicate_labels_keep_distinct_tiles_through_resize_and_availability(browser_page):
@@ -427,31 +466,32 @@ def test_duplicate_labels_keep_distinct_tiles_through_resize_and_availability(br
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
     }""")
-    page.get_by_role("button", name="Same tank · unavailable").wait_for()
-    assert page.locator("fixture-heading").all_text_contents() == ["Water zone", "Water zone"]
-    for _ in range(3):
-        page.keyboard.press("Tab")
+    page.get_by_role("button", name="Same tank · 液位讀值不可用").wait_for()
+    assert page.locator(".zone-head h2").all_text_contents() == ["Water zone", "Water zone"]
+    page.locator(".tank .level").first.focus()
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
     page.evaluate("""() => {
-        window.retained = [...card.shadowRoot.querySelectorAll('fixture-tile')];
-        window.middleButton = retained[1].shadowRoot.querySelector('.body');
+        window.retained = [...card.shadowRoot.querySelectorAll('.level')];
+        window.middleButton = retained[1];
         window.blurs = 0;
         middleButton.addEventListener('blur', () => blurs++);
     }""")
-    assert page.evaluate("retained[1].shadowRoot.activeElement === middleButton")
+    assert page.evaluate("card.shadowRoot.activeElement === middleButton")
     page.evaluate("""() => {
-        document.querySelector('#area').style.width = '720px';
+        document.querySelector('#area').style.width = '740px';
         const next = {...states, 'sensor.renamed': {...states['sensor.p2'], state: '24'}};
         delete next['sensor.p2'];
         card.hass = snapshot(next);
     }""")
-    assert page.locator("fixture-tile .body").all_text_contents() == [
-        "Same tank · 10", "Same tank · 24", "Same tank · 30"
+    assert page.locator(".level").evaluate_all("els => els.map(el => el.getAttribute('aria-label'))") == [
+        "Same tank · 10.00 m", "Same tank · 24.00 m", "Same tank · 30.00 m"
     ]
     assert page.evaluate("""() => {
         const zones = [...card.shadowRoot.querySelectorAll('[data-zone-id]')];
         return innerWidth === 1100 && zones[0].offsetLeft < zones[1].offsetLeft &&
-            [...card.shadowRoot.querySelectorAll('fixture-tile')].every((tile, i) => tile === retained[i]) &&
-            retained[1].shadowRoot.activeElement === middleButton && blurs === 0;
+            [...card.shadowRoot.querySelectorAll('.level')].every((tile, i) => tile === retained[i]) &&
+            card.shadowRoot.activeElement === middleButton && blurs === 0;
     }""")
     page.keyboard.press("Enter")
     assert page.evaluate("activity.events") == [["hass-more-info", {"entityId": "sensor.renamed"}]]
@@ -487,26 +527,16 @@ def test_malformed_or_conflicting_projections_cannot_create_tiles(browser_page):
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
     }""")
-    page.get_by_role("button", name="Tank 1 · 10", exact=True).wait_for()
-    assert page.locator("fixture-heading").all_text_contents() == ["Water zone"]
-    assert page.locator("fixture-tile .body").all_text_contents() == ["Tank 1 · 10"]
-    assert page.evaluate("activity.cards.filter(({type}) => type === 'tile').map(({entity}) => entity)") == [
-        "sensor.good"
-    ]
+    page.get_by_role("button", name="Tank 1 · 10.00 m", exact=True).wait_for()
+    assert page.locator(".zone-head h2").all_text_contents() == ["Water zone"]
+    assert page.locator(".level").evaluate_all("els => els.map(el => el.getAttribute('aria-label'))") == ["Tank 1 · 10.00 m"]
+    page.locator(".level").click()
+    assert page.evaluate("activity.events") == [["hass-more-info", {"entityId": "sensor.good"}]]
 
 
 def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        customElements.define('ha-button', class extends HTMLElement {
-            constructor() {
-                super();
-                this.attachShadow({mode: 'open', delegatesFocus: true});
-                this.shadowRoot.innerHTML = '<button><slot></slot></button>';
-            }
-            set disabled(value) { this.shadowRoot.querySelector('button').disabled = value; }
-            get disabled() { return this.shadowRoot.querySelector('button').disabled; }
-        });
         window.manual = (role, action, overrides = {}) => {
             const entity_id = `${action === 'status' ? 'sensor' : 'button'}.${role}_${action}`;
             return {entity_id, state: action === 'status' ? overrides.phase ?? 'idle' : 'unknown',
@@ -538,22 +568,25 @@ def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(brows
     tank = page.locator(f'[data-tank-id="{1:032x}"]')
     refill = tank.locator('[data-manual-role="refill"]')
     alarm = tank.locator('[data-manual-role="alarm"]')
-    start = refill.get_by_role("button", name="Start", exact=True)
-    stop = refill.get_by_role("button", name="Stop", exact=True)
-    reset = refill.get_by_role("button", name="Clear fault", exact=True)
+    start = refill.locator('[data-action="start"]')
+    stop = refill.locator('[data-action="stop"]')
+    reset = refill.locator('[data-action="reset"]')
     dialog = page.get_by_role("dialog")
     start.click()
     assert dialog.is_visible()
     assert page.evaluate("calls.length") == 0
     page.keyboard.press("Escape")
     assert not dialog.is_visible()
-    assert start.evaluate("b => b.getRootNode().activeElement === b.parentNode || b === b.getRootNode().activeElement")
-    assert reset.is_disabled()
-    assert page.locator(f'[data-tank-id="{2:032x}"] [data-manual-role]').count() == 0
+    assert start.evaluate("b => b === b.getRootNode().activeElement")
+    assert reset.is_hidden()
+    details = tank.locator(".diagnostics")
+    tank.locator(".diagnostics-toggle").click()
+    assert details.get_by_text("要求：關", exact=True).count() == 2
+    assert page.locator(f'[data-tank-id="{2:032x}"]').get_by_role("button", name="手動補水", exact=True).is_disabled()
     start.click()
-    dialog.get_by_role("button", name="Confirm start", exact=True).click()
+    dialog.get_by_role("button", name="確認開始", exact=True).click()
     assert page.evaluate("calls") == [["button", "press", {}, {"entity_id": "button.refill_start"}]]
-    assert refill.get_by_text("HA feedback: Off", exact=False).is_visible()
+    assert tank.get_by_text("補水輸出：關", exact=True).is_visible()
     assert start.is_disabled()
     page.evaluate("""() => {
         states['button.renamed_refill_start'] = {...states['button.refill_start'], entity_id: 'button.renamed_refill_start'};
@@ -563,28 +596,32 @@ def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(brows
     assert start.is_disabled(), "renaming an entity cannot retire its unresolved logical Start"
     assert stop.is_enabled()
     before = stop.bounding_box()
+    original_stop = stop.element_handle()
     stop.focus()
     page.evaluate("""() => {
         states['sensor.refill_status'] = manual('refill', 'status', {
             phase: 'starting', requested: 'on', pending_on: true, can_start: false});
         push();
     }""")
-    assert stop.evaluate("b => b.getRootNode().activeElement === b.parentNode || b === b.getRootNode().activeElement")
+    assert stop.evaluate("b => b === b.getRootNode().activeElement")
+    assert stop.evaluate("(node, old) => node === old", original_stop)
     assert stop.bounding_box() == before
-    assert refill.get_by_text("Starting", exact=False).is_visible()
-    alarm.get_by_role("button", name="Start", exact=True).click()
+    assert tank.get_by_text("啟動中", exact=True).is_visible()
+    assert refill.get_by_text("待處理：開", exact=True).is_visible()
+    assert details.get_by_text("要求：開", exact=True).is_visible()
+    alarm.get_by_role("button", name="開啟告警", exact=True).click()
     assert dialog.is_visible()
     stop.click()
     assert not dialog.is_visible(), "cross-role confirmation must not block Stop during ON"
     assert page.evaluate("calls[1]") == ["button", "press", {}, {"entity_id": "button.refill_stop"}]
     assert stop.is_disabled()
-    alarm.get_by_role("button", name="Start", exact=True).click()
+    alarm.get_by_role("button", name="開啟告警", exact=True).click()
     page.evaluate("""() => {
         states['button.alarm_duplicate'] = {...states['button.alarm_start'], entity_id: 'button.alarm_duplicate'};
         push();
     }""")
     assert not dialog.is_visible()
-    assert alarm.get_by_role("button", name="Start", exact=True).is_disabled()
+    assert alarm.get_by_role("button", name="開啟告警", exact=True).is_disabled()
     assert page.evaluate("calls.length") == 2
     page.evaluate("""() => {
         delete states['button.alarm_duplicate'];
@@ -595,14 +632,16 @@ def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(brows
         push();
     }""")
     assert not page.get_by_text("raw private error", exact=False).count()
+    reset.focus()
     reset.click()
     assert page.evaluate("calls[2]") == ["button", "press", {}, {"entity_id": "button.refill_reset"}]
+    assert stop.evaluate("b => b === b.getRootNode().activeElement")
     page.evaluate("""() => {
         states['button.alarm_start'] = manual('alarm', 'start', {version: '1'});
         push('zh-Hant');
     }""")
-    assert alarm.get_by_role("button", name="開始", exact=True).is_disabled()
-    assert refill.get_by_text("HA 回報：關閉", exact=False).is_visible()
+    assert alarm.get_by_role("button", name="開啟告警", exact=True).is_disabled()
+    assert tank.get_by_text("補水輸出：關", exact=True).is_visible()
     page.evaluate("""() => {
         calls[2].settle.resolve();
         states['sensor.refill_status'] = manual('refill', 'status', {
@@ -611,19 +650,277 @@ def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(brows
     }""")
     assert refill.get_by_text("請重新啟動 Home Assistant", exact=False).is_visible()
     assert refill.get_by_role("button", name="清除故障", exact=True).is_disabled()
-    assert refill.get_by_role("button", name="開始", exact=True).is_disabled()
-    assert refill.get_by_role("button", name="停止", exact=True).is_enabled()
+    assert start.is_disabled()
+    assert refill.get_by_role("button", name="停止補水", exact=True).is_enabled()
     page.evaluate("""() => {
         states['sensor.alarm_status'] = {...states['sensor.alarm_status'], state: 'unavailable'};
         push();
     }""")
-    assert alarm.get_by_text("HA feedback: Unknown", exact=True).is_visible()
-    assert alarm.get_by_role("button", name="Stop", exact=True).is_enabled()
-    assert alarm.get_by_role("button", name="Clear fault", exact=True).is_disabled()
+    assert tank.get_by_text("告警輸出：未知", exact=True).is_visible()
+    assert alarm.get_by_role("button", name="關閉告警", exact=True).is_enabled()
+    assert alarm.locator('[data-action="reset"]').is_hidden()
     page.evaluate("""() => {
         const old = states['button.alarm_stop'];
         states['button.alarm_bad'] = {...old, entity_id: 'switch.bad'};
         push();
     }""")
-    assert alarm.get_by_role("button", name="Stop", exact=True).is_disabled()
+    assert alarm.get_by_role("button", name="關閉告警", exact=True).is_disabled()
     assert page.evaluate("calls.length") == 3
+
+
+def test_approved_console_has_chinese_tabs_and_two_truthful_action_slots(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        const entity_id = 'sensor.p1';
+        const state = projection(1);
+        state.entity_id = entity_id;
+        state.state = '1.23';
+        const {zone, tank} = state.attributes.uninus_water_dashboard;
+        zone.name = '東區';
+        tank.name = '東 1 桶';
+        state.attributes.unit_of_measurement = 'm';
+        state.attributes.uninus_water_display = {version: 1, scale_max_m: 2.5, refill: [0.5, 1.5]};
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = {...snapshot({[entity_id]: state}, 'en-US'), user: {is_admin: true}};
+        document.querySelector('#area').append(card);
+    }""")
+    assert page.get_by_role("heading", name="補水控制", exact=True).is_visible()
+    total = page.get_by_role("button", name="操作總覽", exact=True)
+    parameters = page.get_by_role("button", name="補水參數", exact=True)
+    devices = page.get_by_role("button", name="區域與水桶", exact=True)
+    assert total.get_attribute("aria-pressed") == "true"
+    tank = page.locator(".tank")
+    assert tank.get_by_role("button", name="手動補水", exact=True).is_disabled()
+    assert tank.get_by_role("button", name="開啟告警", exact=True).is_disabled()
+    assert tank.get_by_text("補水輸出：未提供", exact=True).is_visible()
+    toggle = tank.get_by_role("button", name="未提供：詳細狀態", exact=True)
+    assert toggle.get_attribute("aria-expanded") == "false"
+    assert toggle.evaluate("b => b.parentElement.tagName === 'HEADER'")
+    initial_height = tank.bounding_box()["height"]
+    toggle.click()
+    assert toggle.get_attribute("aria-expanded") == "true"
+    assert tank.get_by_text("水位量程：0–2.5 m", exact=True).is_visible()
+    assert tank.bounding_box()["height"] > initial_height
+    toggle.click()
+    assert tank.bounding_box()["height"] == initial_height
+    tank.get_by_role("button", name="東 1 桶 · 1.23 m", exact=True).click()
+    assert page.evaluate("activity.events") == [["hass-more-info", {"entityId": "sensor.p1"}]]
+    old = tank.element_handle()
+    parameters.click()
+    assert parameters.get_attribute("aria-pressed") == "true"
+    assert page.get_by_role("heading", name="各桶門檻與顯示量程", exact=True).is_visible()
+    assert page.get_by_role("region", name="補水參數", exact=True).get_by_text("水位量程：0–2.5 m", exact=True).is_visible()
+    assert not tank.is_visible()
+    devices.click()
+    assert page.get_by_role("heading", name="管理區域與水桶", exact=True).is_visible()
+    assert not page.get_by_role("heading", name="各桶門檻與顯示量程", exact=True).is_visible()
+    assert page.get_by_text("東 1 桶", exact=True).last.is_visible()
+    total.click()
+    assert tank.evaluate("(node, old) => node === old", old)
+
+
+def test_rejected_start_with_unchanged_feedback_leaves_a_guarded_stop_available(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        const metadata = {version: 1, tank_id: id(1), role: 'refill'};
+        const status = {phase: 'idle', requested: 'off', actual: 'off', pending_on: false,
+            pending_off: false, fault: null, max_runtime_seconds: 60, can_start: true};
+        const wire = (entity_id, state, action, fields = {}) => ({entity_id, state,
+            attributes: {uninus_water_manual: {...metadata, action, ...fields}}});
+        const states = {'sensor.p1': projection(1),
+            'sensor.refill_status': wire('sensor.refill_status', 'idle', 'status', status),
+            'button.refill_start': wire('button.refill_start', 'unknown', 'start'),
+            'button.refill_stop': wire('button.refill_stop', 'unknown', 'stop')};
+        window.calls = [];
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = {...snapshot(states), connected: true, callService: (...args) => {
+            calls.push(args);
+            if (calls.length === 1) return new Promise((resolve, reject) => { window.rejectStart = reject; });
+        }};
+        document.querySelector('#area').append(card);
+    }""")
+    start = page.get_by_role("button", name="手動補水", exact=True)
+    stop = page.get_by_role("button", name="停止補水", exact=True)
+    start.click()
+    page.get_by_role("button", name="確認開始", exact=True).click()
+    assert stop.is_enabled()
+    page.evaluate("() => { rejectStart(new Error('transport interrupted')); }")
+    assert page.get_by_text("未確認按鈕請求。", exact=True).is_visible()
+    assert stop.is_visible() and stop.is_enabled()
+    assert page.get_by_text("補水輸出：關", exact=True).is_visible()
+    stop.click()
+    assert page.evaluate("calls") == [
+        ["button", "press", {}, {"entity_id": "button.refill_start"}],
+        ["button", "press", {}, {"entity_id": "button.refill_stop"}],
+    ]
+
+
+@pytest.fixture
+def remap_page(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        const idle = {phase: 'idle', requested: 'off', actual: 'off', pending_on: false,
+            pending_off: false, fault: null, max_runtime_seconds: 60, can_start: true};
+        const wire = (entity_id, action) => ({entity_id, state: action === 'status' ? 'idle' : 'unknown',
+            attributes: {uninus_water_manual: {version: 1, tank_id: id(1), role: 'refill', action,
+                ...(action === 'status' ? idle : {})}}});
+        window.states = {'sensor.p1': projection(1),
+            'sensor.refill_status': wire('sensor.refill_status', 'status'),
+            'button.refill_start': wire('button.refill_start', 'start'),
+            'button.refill_stop': wire('button.refill_stop', 'stop')};
+        window.calls = [];
+        window.replies = [];
+        const service = (...args) => {
+            calls.push(args);
+            return new Promise((resolve, reject) => replies.push({resolve, reject}));
+        };
+        window.push = ({visible = states, connected = true, isAdmin = true} = {}) => {
+            card.hass = {...snapshot({...visible}), connected, user: {id: 'fixture-user', is_admin: isAdmin},
+                callService: service};
+        };
+        window.rename = (from, to) => {
+            states[to] = {...states[from], entity_id: to};
+            delete states[from];
+            push();
+        };
+        window.publishStatus = (fields) => {
+            const current = states['sensor.refill_status'];
+            states[current.entity_id] = {...current, state: fields.phase ?? idle.phase,
+                attributes: {uninus_water_manual: {...current.attributes.uninus_water_manual, ...idle, ...fields}}};
+            push();
+        };
+        window.settle = async (index, reject = false) => {
+            if (reject) replies[index].reject(new Error('private error from retired mapping'));
+            else replies[index].resolve();
+            await new Promise(requestAnimationFrame);
+        };
+        window.card = document.createElement('uninus-water-dashboard');
+        card.setConfig(card.constructor.getStubConfig());
+        push();
+        document.querySelector('#area').append(card);
+    }""")
+    return page
+
+
+def manual_target(entity):
+    return ["button", "press", {}, {"entity_id": entity}]
+
+
+def refill_actions(page):
+    panel = page.locator('[data-manual-role="refill"]')
+    return panel.locator('[data-action="start"]'), panel.locator('[data-action="stop"]')
+
+
+def confirm_refill(page, start):
+    start.click()
+    page.get_by_role("button", name="確認開始", exact=True).click()
+
+
+def test_start_rename_then_original_rejection_keeps_current_guarded_stop(remap_page):
+    page = remap_page
+    start, stop = refill_actions(page)
+    confirm_refill(page, start)
+    assert page.evaluate("calls") == [manual_target("button.refill_start")]
+    assert stop.is_visible() and stop.is_enabled() and start.is_disabled()
+    retained = stop.element_handle()
+    stop.focus()
+    page.evaluate("rename('button.refill_start', 'button.renamed_start')")
+    assert stop.is_visible() and stop.is_enabled() and start.is_disabled()
+    page.evaluate("settle(0, true)")
+    assert stop.is_visible() and stop.is_enabled(), "ambiguous Start must still present the current Stop"
+    assert start.is_hidden() and start.is_disabled()
+    assert stop.evaluate("(b, old) => b === old && b === b.getRootNode().activeElement", retained)
+    assert page.get_by_text("補水輸出：關", exact=True).is_visible()
+    assert page.get_by_text("未確認按鈕請求。", exact=True).count() == 0
+    assert page.get_by_text("private error", exact=False).count() == 0
+    page.evaluate("rename('button.refill_stop', 'button.renamed_stop')")
+    assert stop.evaluate("(b, old) => b === old && b === b.getRootNode().activeElement", retained)
+    stop.click()
+    assert stop.is_visible() and stop.is_disabled() and start.is_disabled()
+    page.evaluate("settle(1, true)")
+    assert stop.is_enabled() and start.is_disabled()
+    stop.click()
+    page.evaluate("settle(2)")
+    assert stop.is_hidden() and start.is_visible() and start.is_enabled()
+    assert page.locator(".level").evaluate("b => b === b.getRootNode().activeElement")
+    assert page.get_by_text("補水輸出：關", exact=True).is_visible()
+    confirm_refill(page, start)
+    assert page.evaluate("calls") == [
+        manual_target("button.refill_start"), manual_target("button.renamed_stop"),
+        manual_target("button.renamed_stop"), manual_target("button.renamed_start"),
+    ]
+    page.evaluate("settle(3)")
+
+
+@pytest.mark.parametrize("gap", ["detach", "offline", "permissions", "duplicate-status", "duplicate-stop"])
+def test_uncertain_start_survives_lost_visibility_without_using_stale_routes(remap_page, gap):
+    page = remap_page
+    start, stop = refill_actions(page)
+    confirm_refill(page, start)
+    page.evaluate("""gap => {
+        if (gap === 'detach') card.remove();
+        if (gap === 'offline') push({connected: false});
+        if (gap === 'permissions') push({visible: {}, isAdmin: false});
+        if (gap.includes('duplicate')) {
+            const key = gap === 'duplicate-status' ? 'sensor.refill_status' : 'button.refill_stop';
+            const duplicate = key.replace('refill_', 'ambiguous_');
+            push({visible: {...states, [duplicate]: {...states[key], entity_id: duplicate}}});
+        }
+    }""", gap)
+    if gap in ("detach", "permissions"):
+        assert start.count() == stop.count() == 0
+    else:
+        assert start.is_disabled() and stop.is_disabled()
+    page.evaluate("settle(0, true)")
+    assert page.evaluate("calls") == [manual_target("button.refill_start")]
+    page.evaluate("""gap => {
+        if (gap === 'detach') document.querySelector('#area').append(card);
+        push({isAdmin: gap !== 'permissions'});
+    }""", gap)
+    assert start.is_hidden() and start.is_disabled() and stop.is_visible() and stop.is_enabled()
+    assert page.get_by_text("未確認按鈕請求。", exact=True).count() == 0
+    stop.click()
+    page.evaluate("settle(1)")
+    assert start.is_visible() and start.is_enabled()
+    assert page.evaluate("calls") == [manual_target("button.refill_start"), manual_target("button.refill_stop")]
+
+
+def test_old_stop_reply_cannot_clear_uncertainty_after_stop_remap_or_before_start_settlement(remap_page):
+    page = remap_page
+    start, stop = refill_actions(page)
+    confirm_refill(page, start)
+    stop.click()
+    page.evaluate("settle(1)")
+    page.evaluate("settle(0, true)")
+    assert start.is_disabled() and stop.is_visible() and stop.is_enabled()
+    stop.click()
+    page.evaluate("rename('button.refill_stop', 'button.renamed_stop')")
+    assert stop.is_disabled(), "Stop remap cannot release the unresolved logical Stop"
+    page.evaluate("settle(2)")
+    assert start.is_disabled() and stop.is_visible() and stop.is_enabled()
+    stop.click()
+    page.evaluate("settle(3)")
+    assert start.is_enabled() and stop.is_hidden()
+    assert page.evaluate("calls") == [
+        manual_target("button.refill_start"), manual_target("button.refill_stop"),
+        manual_target("button.refill_stop"), manual_target("button.renamed_stop"),
+    ]
+
+
+def test_only_authoritative_output_cycle_retires_uncertainty_without_stop(remap_page):
+    page = remap_page
+    start, stop = refill_actions(page)
+    confirm_refill(page, start)
+    page.evaluate("settle(0, true)")
+    page.evaluate("publishStatus({can_start: false})")
+    page.evaluate("publishStatus({})")
+    assert start.is_disabled() and stop.is_visible() and stop.is_enabled()
+    page.evaluate("publishStatus({phase: 'starting', requested: 'on', pending_on: true, can_start: false})")
+    assert start.is_disabled() and stop.is_visible() and stop.is_enabled()
+    page.evaluate("publishStatus({phase: 'stopping', pending_off: true, can_start: false})")
+    assert start.is_disabled() and stop.is_visible() and stop.is_enabled()
+    page.evaluate("publishStatus({})")
+    assert start.is_visible() and start.is_enabled() and stop.is_hidden()
+    assert page.evaluate("calls") == [manual_target("button.refill_start")]

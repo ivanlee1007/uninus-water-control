@@ -13,7 +13,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.selector import BooleanSelector, EntitySelector, NumberSelector, SelectSelector, TextSelector
 
 from . import async_prune_disabled_levels
-from .inventory import DOMAIN, TITLE, Zone, inventory, level_source, new_tank, new_zone
+from .inventory import DISPLAY_SCALES, DOMAIN, TITLE, Zone, inventory, level_source, new_tank, new_zone
 from .manual import DEFAULT_SECONDS, ROLES, output_conflicts, output_row, source_conflicts
 
 LEVEL_SENSOR = "level_sensor"
@@ -152,6 +152,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             step_id="init",
             menu_options=[
                 "add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank", "edit_thresholds",
+                "edit_display_scale",
             ],
         )
 
@@ -177,6 +178,9 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
     async def async_step_edit_thresholds(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self._choose("edit_thresholds")
 
+    async def async_step_edit_display_scale(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return self._choose("edit_display_scale")
+
     def _require_fresh(self) -> ConfigEntry:
         entry = self.hass.config_entries.async_get_entry(self.handler)
         if (
@@ -187,13 +191,17 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             raise AbortFlow("configuration_changed")
         return entry
 
+    @staticmethod
+    def _require_settled(entry: ConfigEntry) -> None:
+        runtime = getattr(entry, "runtime_data", None)
+        if runtime and (runtime.retiring or any(not role.closed for role in runtime.roles.values())):
+            raise AbortFlow("manual_outputs_unsettled")
+
     def _commit(self) -> ConfigFlowResult:
         # Core's OptionsFlowManager updates the options synchronously on this
         # return path; do not put an await between this check and that update.
         entry = self._require_fresh()
-        runtime = getattr(entry, "runtime_data", None)
-        if runtime and (runtime.retiring or any(not role.closed for role in runtime.roles.values())):
-            raise AbortFlow("manual_outputs_unsettled")
+        self._require_settled(entry)
         if (manual := self._base_options.get("manual")) and not any(
             tank["id"] == manual["tank_id"] for zone in self._zones for tank in zone["tanks"]
         ):
@@ -213,7 +221,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
 
     def _target_form(self, user_input: dict | None) -> ConfigFlowResult:
         self._require_fresh()
-        tank_target = self._operation in ("edit_tank", "remove_tank", "edit_thresholds")
+        tank_target = self._operation in ("edit_tank", "remove_tank", "edit_thresholds", "edit_display_scale")
         field = "tank_id" if tank_target else "zone_id"
         targets = {}
         registry = er.async_get(self.hass)
@@ -243,6 +251,8 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             return self._tank_form(None)
         if self._operation == "edit_thresholds":
             return self._threshold_form(None)
+        if self._operation == "edit_display_scale":
+            return self._display_scale_form(None)
         if self._operation == "remove_zone" and len(self._zones) == 1:
             return self.async_abort(reason="minimum_zones")
         if self._operation == "remove_tank" and len(self._zone["tanks"]) == 1:
@@ -419,6 +429,45 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         return self.async_show_form(
             step_id="save_thresholds", data_schema=vol.Schema(fields), errors=errors,
             description_placeholders={"target": self._target_label},
+        )
+
+    async def async_step_save_display_scale(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return self._display_scale_form(user_input)
+
+    def _display_scale_form(self, user_input: dict | None) -> ConfigFlowResult:
+        entry = self._require_fresh()
+        assert self._tank_index is not None
+        tank_id = self._zone["tanks"][self._tank_index]["id"]
+        scales = entry.data.get(DISPLAY_SCALES, {})
+        key = "scale_max_m"
+        value = scales.get(tank_id) if user_input is None else user_input.get(key)
+        valid = type(value) in (int, float) and isfinite(value) and value > 0
+        if user_input is not None and (valid or value is None):
+            self._require_settled(entry)
+            # Replacing entry.options would invalidate the manual controller's
+            # owner token even without reload. Persist display preferences in
+            # entry.data and finish the native flow without an options write.
+            data = dict(entry.data)
+            current_ids = {tank["id"] for zone in self._zones for tank in zone["tanks"]}
+            updated = {ident: scale for ident, scale in scales.items() if ident in current_ids}
+            if valid:
+                updated[tank_id] = value
+            else:
+                updated.pop(tank_id, None)
+            if updated:
+                data[DISPLAY_SCALES] = updated
+            else:
+                data.pop(DISPLAY_SCALES, None)
+            self.hass.config_entries.async_update_entry(entry, data=data)
+            # OptionsFlowManager explicitly skips write/reload for None.
+            return self.async_create_entry(data=None)  # type: ignore[arg-type]
+        return self.async_show_form(
+            step_id="save_display_scale", description_placeholders={"target": self._target_label},
+            data_schema=vol.Schema({
+                vol.Optional(key, description={"suggested_value": value if valid else None}):
+                    _ThresholdNumberSelector({"step": "any", "mode": "box", "unit_of_measurement": "m"}),
+            }),
+            errors={key: "positive_display_scale"} if user_input is not None else {},
         )
 
     async def async_step_confirm_remove(self, user_input: dict | None = None) -> ConfigFlowResult:

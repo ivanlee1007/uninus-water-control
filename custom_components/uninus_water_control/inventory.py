@@ -8,6 +8,7 @@ from homeassistant.helpers.entity_registry import EntityRegistry
 
 DOMAIN = "uninus_water_control"
 TITLE = "Uninus Water Control"
+DISPLAY_SCALES = "display_scales_m"
 
 
 class Tank(TypedDict):
