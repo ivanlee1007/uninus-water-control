@@ -6,7 +6,7 @@ from homeassistant.core import valid_entity_id
 from homeassistant.helpers import entity_registry as er
 
 from .inventory import DISPLAY_SCALES, DOMAIN
-from .manual import output_conflicts, source_conflicts
+from .binding_validation import binding_errors
 from .settings import BINDINGS, IDENT, SettingsError, _fields, _invalid, matches
 
 _DOMAINS = dict(zip(BINDINGS, ('sensor', 'switch', 'switch'), strict=True))
@@ -55,7 +55,7 @@ def build(settings, msg):
     registry = er.async_get(settings.hass)
     old_zones = {z['id']: z for z in settings.zones}
     old_tanks = {t['id']: t for z in old_zones.values() for t in z['tanks']}
-    seen_zones, seen_tanks, zones, changed = set(), set(), [], []
+    seen_zones, seen_tanks, zones = set(), set(), []
     protected = settings.manual.get('tank_id')
     if not msg['zones']:
         _invalid()
@@ -101,16 +101,14 @@ def build(settings, msg):
                 if not _candidate(row) or row.id != row_id:
                     raise SettingsError('stale_source')
                 tank[field], tank[key] = entity, row.id
-                changed.append((tank['id'], field, row))
+
     removed = {'zones': sorted(old_zones.keys() - seen_zones), 'tanks': sorted(old_tanks.keys() - seen_tanks)}
     if protected in removed['tanks']:
         raise SettingsError('protected_topology')
     if msg['remove'] != removed:
         raise SettingsError('removal_confirmation_required')
-    for ident, field, row in changed:
-        if (source_conflicts(zones, ident, row) if field == 'level_sensor'
-                else output_conflicts(registry, zones, ident, field.removesuffix('_switch'), row)):
-            raise SettingsError('binding_conflict')
+    if binding_errors(registry, settings.zones, zones):
+        raise SettingsError('binding_conflict')
     if zones == settings.zones:
         _invalid()
     return settings.topology | {'zones': zones, DISPLAY_SCALES: {

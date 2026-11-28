@@ -1,6 +1,6 @@
 # Alarm output history wire v1
 
-`uninus_water_control/alarm_history_get` is read-only. The normal Lovelace card offers it under **補水參數 → 告警輸出紀錄**; the native card editor remains the only card configuration surface. The card sends one request on explicit refresh. It does not poll, fetch other tanks, call a device service, edit settings, or configure Recorder.
+`uninus_water_control/alarm_history_get` is read-only. The normal Lovelace card offers it under **補水參數 → 告警輸出紀錄**; the native card editor edits display-only configuration, while the separate per-tank Quick parameters dialog edits shared numeric policy. The history reader itself never changes either kind of setting. The card sends one request on explicit refresh. It does not poll, fetch other tanks, call a device service, edit settings, or configure Recorder.
 
 ## Request
 

@@ -126,6 +126,9 @@ const STYLE = `
     position:static; width:100%; max-width:none; margin:6px 0 0; padding:8px;
     border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--ink);
   }
+  .quick-dialog { width:min(680px,calc(100% - 24px)); max-height:calc(100dvh - 32px); overflow:auto; margin:auto;
+    border:1px solid var(--line); border-radius:12px; padding:12px; background:var(--bg); color:var(--ink); }
+  .quick-dialog::backdrop { background:#0006; }
   .manual-dialog p { margin:4px 0; }
   .manual-dialog-actions { display:flex; flex-wrap:wrap; justify-content:end; gap:4px; }
   .formbox { display:grid; gap:10px; }
@@ -173,16 +176,43 @@ function uniformPair(displays, kind) {
 }
 
 
+// Home Assistant DistanceConverter units, expressed as exact decimal factors.
+const METRE_FACTORS = new Map([
+  ["m", [1n, 0]], ["cm", [1n, -2]], ["mm", [1n, -3]], ["km", [1n, 3]],
+  ["in", [254n, -4]], ["ft", [3048n, -4]], ["yd", [9144n, -4]],
+  ["mi", [1609344n, -3]], ["nmi", [1852n, 0]],
+]);
+
+function metreSample(raw, [factor, shift]) {
+  const [mantissa, power = "0"] = raw.toLowerCase().split("e");
+  const negative = mantissa.startsWith("-");
+  const unsigned = mantissa.replace(/^[+-]/, "");
+  const fraction = unsigned.split(".")[1]?.length ?? 0;
+  let digits = (BigInt(unsigned.replace(".", "")) * factor).toString();
+  if (digits === "0") return negative ? "-0" : "0";
+  let exponent = Number(power) - fraction + shift;
+  const trimmed = digits.replace(/0+$/, "");
+  exponent += digits.length - trimmed.length;
+  digits = trimmed;
+  const point = digits.length + exponent;
+  // Avoid expanding extreme exponents into unbounded DOM text.
+  const sample = point > 21 || point <= -6 ? `${digits[0]}${digits.length > 1 ? `.${digits.slice(1)}` : ""}e${point - 1}` :
+    point <= 0 ? `0.${"0".repeat(-point)}${digits}` : point >= digits.length ? `${digits}${"0".repeat(point - digits.length)}` :
+      `${digits.slice(0, point)}.${digits.slice(point)}`;
+  return negative ? `-${sample}` : sample;
+}
+
 function depthFrom(state) {
   const raw = state.state;
-  if (state.attributes?.unit_of_measurement !== "m" || typeof raw !== "string" ||
-      !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(raw)) return undefined;
-  const value = Number(raw);
+  const unit = state.attributes?.unit_of_measurement;
+  if (!METRE_FACTORS.has(unit) || typeof raw !== "string" ||
+      !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(raw) || !Number.isFinite(Number(raw))) return undefined;
+  const sample = unit === "m" ? raw : metreSample(raw, METRE_FACTORS.get(unit));
+  const value = Number(sample);
   if (!Number.isFinite(value)) return undefined;
-  // Match the proposal's two-place readout without rounding away a distinct
-  // numeric sample on the other side of a threshold.
-  const shortDepth = /^[+-]?\d+(?:\.\d{1,2})?$/.test(raw) && Math.abs(value) < 1e21;
-  return { shown: shortDepth ? value.toFixed(2) : raw, value };
+  // Do not round away a converted decimal sample across a policy boundary.
+  const shortDepth = /^[+-]?\d+(?:\.\d{1,2})?$/.test(sample) && Math.abs(value) < 1e21;
+  return { shown: shortDepth ? value.toFixed(2) : sample, value };
 }
 
 function updateGauge(slot, depth, max) {
@@ -414,6 +444,9 @@ class UninusWaterDashboard extends HTMLElement {
   #configured = false;
   #preview;
   #editMode;
+  #config;
+  #quick;
+  #quickPanel;
 
   #layout;
   #notice;
@@ -477,7 +510,7 @@ class UninusWaterDashboard extends HTMLElement {
     this.#overview = { count, summary, refill, alarm };
     for (const [key, titleText, linkText, help] of [
       ["parameters", "各桶門檻與顯示量程", null,
-        "此處僅顯示已套用的參數。管理員可在「編輯儀表板 → 編輯補水卡片」調整；門檻預覽不操作設備。"],
+        "此處僅顯示已套用的參數。管理員可在正常操作總覽開啟每桶的「快捷參數」調整；共用預設、設備與安全設定請使用原生整合設定。門檻預覽不操作設備。"],
       ["devices", "區域與水桶清單", "前往整合設定：區域與水桶",
         "此處列出可讀取的水桶與手動控制。若要新增、改名或變更綁定，在整合的「設定」選單選擇對應的區域或水桶操作。"],
     ]) {
@@ -549,6 +582,7 @@ class UninusWaterDashboard extends HTMLElement {
 
   #hostModeChanged() {
     if (!this.#operationView()) {
+      this.#closeQuick();
       this.#closeConfirmation();
       this.#clearPanelFeedback();
     }
@@ -564,9 +598,14 @@ class UninusWaterDashboard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (config?.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
-    if (this.#configured) return;
+    const next = displayConfig(config);
+    const detailsChanged = this.#config?.show_details !== next.show_details;
+    this.#config = next;
     this.#configured = true;
+    if (detailsChanged) for (const zone of this.#zones.values()) for (const slot of zone.tiles.values()) {
+      slot.host.querySelector('.diagnostics').hidden = !next.show_details;
+      slot.pill.setAttribute("aria-expanded", String(next.show_details));
+    }
     this.#render();
   }
 
@@ -575,6 +614,7 @@ class UninusWaterDashboard extends HTMLElement {
       value?.connection, value?.connected, value?.callService];
     if (!this.#authority || authority.some((part, index) => part !== this.#authority[index])) {
       this.#authority = authority;
+      this.#closeQuick();
       this.#closeConfirmation();
       this.#clearPanelFeedback();
     }
@@ -588,6 +628,7 @@ class UninusWaterDashboard extends HTMLElement {
 
   disconnectedCallback() {
     this.#closeConfirmation();
+    this.#closeQuick();
     this.#clearPanelFeedback();
     this.#clearHistory(true);
   }
@@ -761,9 +802,11 @@ class UninusWaterDashboard extends HTMLElement {
     const pending = this.#confirmation;
     const node = this.#dialog?.node;
     this.#confirmation = undefined;
-    if (!pending || !node?.open) return;
-    const restoreFocus = node.contains(this.shadowRoot.activeElement);
-    node.close();
+    const restoreFocus = pending && node?.contains(this.shadowRoot.activeElement);
+    if (node?.open) node.close();
+    if (this.#dialog) text(this.#dialog.summary, "");
+    node?.remove();
+    if (!pending) return;
     if (restoreFocus && pending.panel.host.isConnected) {
       const preferred = pending.panel.buttons[after];
       const fallback = pending.panel.buttons.stop;
@@ -1049,6 +1092,10 @@ class UninusWaterDashboard extends HTMLElement {
     const rangeMessage = element("p", "dim range-warning");
     const info = element("div", "info");
     const commands = element("div", "commands");
+    const quick = button("quick-parameters");
+    text(quick, "快捷參數");
+    quick.hidden = true;
+    quick.addEventListener("click", event => { if (event.isTrusted) this.#openQuick(tank.id); });
     const diagnostics = element("div", "diagnostics");
     diagnostics.id = `details-${tank.id}`;
     diagnostics.hidden = true;
@@ -1065,8 +1112,10 @@ class UninusWaterDashboard extends HTMLElement {
       node.addEventListener("click", () => moreInfo(node, node.dataset.entity));
       return [kind, node];
     }));
-    host.append(header, measurement, rangeMessage, info, commands, diagnostics);
-    const slot = { host, title, pill, readout, vessel, water, value, unit, relation, range, rangeMessage, previewRows };
+    host.append(header, measurement, rangeMessage, info, commands, quick, diagnostics);
+    diagnostics.hidden = !this.#config.show_details;
+    pill.setAttribute("aria-expanded", String(!diagnostics.hidden));
+    const slot = { host, title, pill, readout, vessel, water, value, unit, relation, range, rangeMessage, previewRows, quick };
     readout.addEventListener("click", () => moreInfo(readout, slot.entity));
     const roles = new Map();
     for (const role of ROLES) roles.set(role, this.#newPanel(tank.id, role, slot));
@@ -1077,12 +1126,63 @@ class UninusWaterDashboard extends HTMLElement {
     return slot;
   }
 
+  #displayZones(states) {
+    const config = this.#config;
+    return zonesFrom(states).filter(zone => !config.zone_ids.length || config.zone_ids.includes(zone.id)).map(zone => ({
+      ...zone, tanks: zone.tanks.filter(tank => !config.tank_ids.length || config.tank_ids.includes(tank.id)),
+    })).filter(zone => zone.tanks.length);
+  }
+
+  #quickTarget(tankId) {
+    const hass = this.#hass;
+    if (!this.#operationView() || !authorizedEditor(editorPrincipal(hass)) || !readyTransport(editorTransport(hass))) return;
+    for (const zone of this.#displayZones(hass.states ?? {})) {
+      const tank = zone.tanks.find(tank => tank.id === tankId);
+      if (!tank) continue;
+      const entry_id = hass.states[tank.entity]?.attributes?.uninus_water_settings_entry;
+      if (!matchesId(entry_id, ENTRY_ID)) return;
+      return { entry_id, zone_id: zone.id, tank_id: tank.id, entity_id: tank.entity };
+    }
+  }
+
+  #openQuick(tankId) {
+    const target = this.#quickTarget(tankId);
+    if (!target) return;
+    this.#closeQuick();
+    this.#closeConfirmation();
+    const node = element("dialog", "quick-dialog");
+    node.setAttribute("aria-label", "快捷參數");
+    const cancel = button(); text(cancel, "取消");
+    cancel.addEventListener("click", () => this.#closeQuick());
+    node.addEventListener("cancel", event => { event.preventDefault(); this.#closeQuick(); });
+    this.#quickPanel ??= element(`${TAG}-quick-parameters`);
+    this.#quickPanel.setConfig({ type: `custom:${TAG}`, target });
+    this.#quickPanel.hass = this.#hass;
+    node.append(cancel, this.#quickPanel);
+    this.#quick = { node, target, invoker: this.shadowRoot.querySelector(`[data-tank-id="${tankId}"] .quick-parameters`) };
+    this.#shell.append(node);
+    node.showModal(); cancel.focus();
+  }
+
+  #closeQuick() {
+    const quick = this.#quick;
+    if (!quick) return;
+    this.#quick = undefined;
+    quick.node.close(); quick.node.remove();
+    if (quick.invoker?.isConnected && !quick.invoker.hidden) quick.invoker.focus({ preventScroll: true });
+  }
+
   #render() {
     if (!this.isConnected || !this.#configured) return;
     const states = this.#hass?.states;
     this.#shell.toggleAttribute("data-dark", this.#hass?.themes?.darkMode === true);
     for (const { link } of this.#views.values()) if (link) link.hidden = this.#hass?.user?.is_admin !== true;
-    const zones = states ? zonesFrom(states) : [];
+    const zones = this.#displayZones(states ?? {});
+    if (this.#quick) {
+      const target = this.#quickTarget(this.#quick.target.tank_id);
+      if (!target || JSON.stringify(target) !== JSON.stringify(this.#quick.target)) this.#closeQuick();
+      else this.#quickPanel.hass = this.#hass;
+    }
     this.#notice.hidden = zones.length > 0;
     text(this.#notice, states ? "沒有可顯示的水桶。" : "正在載入總覽卡片…");
     this.#updateCards(zones, states ?? {});
@@ -1119,6 +1219,7 @@ class UninusWaterDashboard extends HTMLElement {
       for (const tank of zone.tanks) {
         const slot = current.tiles.get(tank.id) ?? this.#newTank(tank);
         slot.entity = tank.entity;
+        slot.quick.hidden = !this.#quickTarget(tank.id);
         nextTiles.set(tank.id, slot);
         nextPanels.set(tank.id, slot.roles);
         const state = states[tank.entity];
@@ -1195,11 +1296,15 @@ class UninusWaterDashboard extends HTMLElement {
     const pending = this.#confirmation?.panel;
     if (pending && nextPanels.get(pending.tankId)?.get(pending.role) !== pending) this.#closeConfirmation();
     if (focusWasLost(this.shadowRoot, focused)) this.#views.get(this.#view).tab.focus({ preventScroll: true });
-    if (this.#view !== "overview") this.#updateSettings(zones, states, displays, manual);
+    // Hidden tabs retain DOM too: reconcile every inventory against the current
+    // readable snapshot, not only the selected tab.
+    for (const key of ["parameters", "devices"]) {
+      if (key === this.#view || this.#views.get(key).rows.size) this.#updateSettings(key, zones, states, displays, manual);
+    }
   }
 
-  #updateSettings(zones, states, displays, manual) {
-    const view = this.#views.get(this.#view);
+  #updateSettings(key, zones, states, displays, manual) {
+    const view = this.#views.get(key);
     const next = new Map();
     for (const zone of zones) {
       let group = view.rows.get(zone.id);
@@ -1221,7 +1326,7 @@ class UninusWaterDashboard extends HTMLElement {
           row = { wrapper, name, notes };
         }
         text(row.name, tank.name);
-        if (this.#view === "parameters") {
+        if (key === "parameters") {
           const d = displays.get(tank.id);
           text(row.notes[0], d.refill ? refillText(d.refill) : "補水門檻未設定");
           text(row.notes[1], d.alarm ? alarmText(d.alarm) : "低液位告警未設定");
@@ -1261,7 +1366,7 @@ const matchesId = (value, pattern) => typeof value === "string" && pattern.test(
 const validScale = (value) => value === null || (Number.isFinite(value) && value > 0);
 const settingsPairText = (kind, pair) => !pair ? "未設定" : kind === "refill" ?
   `${pair[0]}／${pair[1]} m` : `≤ ${pair[0]} m · ${pair[1]} 秒`;
-const APPLIED = "已套用；不必再按外層儲存。";
+const APPLIED = "已儲存並重新讀回確認。";
 
 const MAX_ALARM_DELAY = 2147483647;
 
@@ -1312,90 +1417,12 @@ function readSettingsDto(value, entry) {
   return { version: 1, entry_id: entry, revision: value.revision, source_snapshot: value.source_snapshot, common, zones };
 }
 
-const TOPOLOGY_ROLES = { level_sensor: "液位感測器", refill_switch: "補水開關（選填）", alarm_switch: "告警開關（選填）" };
-const UNAVAILABLE_BINDING = "現有綁定無法使用";
-const exactFields = (value, fields) => value && typeof value === "object" && !Array.isArray(value) &&
-  Object.keys(value).length === fields.length && fields.every((field) => Object.hasOwn(value, field));
-const topologyName = (name) => typeof name === "string" && name.trim().length > 0;
 const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-const topologyShape = (zones) => zones.map(({ id, name, tanks }) => ({ id, name, tanks: tanks.map(
-  ({ id, name, level_sensor, refill_switch, alarm_switch }) => ({ id, name, level_sensor, refill_switch, alarm_switch })) }));
-
-function readTopologyDto(value, entry) {
-  const bad = () => { throw settingsError("invalid_format"); };
-  const binding = (row, domain, existing) => {
-    if (!exactFields(row, ["entity_id", "registry_id"])) bad();
-    const registered = matchesId(row.registry_id, SETTINGS_ID);
-    if (existing && row.entity_id === null && registered) return { entity_id: null, registry_id: row.registry_id };
-    if (typeof row.entity_id !== "string" || !/^(?:sensor|switch)\.[a-z0-9_]+$/.test(row.entity_id) ||
-        (domain && !row.entity_id.startsWith(`${domain}.`)) || !(registered || existing && row.registry_id === null)) bad();
-    return { entity_id: row.entity_id, registry_id: row.registry_id };
-  };
-  if (!exactFields(value, ["version", "entry_id", "revision", "source_snapshot", "zones", "candidates"]) ||
-      value.version !== 1 || value.entry_id !== entry || !/^[0-9a-f]{64}$/.test(value.revision) ||
-      !/^[0-9a-f]{64}$/.test(value.source_snapshot) || !Array.isArray(value.zones) || !value.zones.length ||
-      !Array.isArray(value.candidates)) bad();
-  const zIds = new Set(), tIds = new Set(), names = new Set();
-  const zones = value.zones.map((z) => {
-    if (!exactFields(z, ["id", "name", "tanks"]) || !matchesId(z.id, SETTINGS_ID) || zIds.has(z.id) ||
-        !topologyName(z.name) || !Array.isArray(z.tanks) || !z.tanks.length) bad();
-    zIds.add(z.id);
-    const tanks = z.tanks.map((t) => {
-      if (!exactFields(t, ["id", "name", "protected", ...Object.keys(TOPOLOGY_ROLES)]) || !matchesId(t.id, SETTINGS_ID) ||
-          tIds.has(t.id) || !topologyName(t.name) || typeof t.protected !== "boolean") bad();
-      tIds.add(t.id);
-      return { id: t.id, name: t.name, protected: t.protected, level_sensor: binding(t.level_sensor, "sensor", true),
-        refill_switch: t.refill_switch === null ? null : binding(t.refill_switch, "switch", true),
-        alarm_switch: t.alarm_switch === null ? null : binding(t.alarm_switch, "switch", true) };
-    });
-    return { id: z.id, name: z.name, tanks };
-  });
-  const candidates = value.candidates.map((raw) => {
-    const row = binding(raw, null, false);
-    if (names.has(row.entity_id)) bad();
-    names.add(row.entity_id);
-    return row;
-  });
-  return { version: 1, entry_id: entry, revision: value.revision, source_snapshot: value.source_snapshot, zones, candidates };
-}
-
-function verifyTopologySave(draft, saved, settings, readback, baseline) {
-  if (saved.revision === baseline.revision || saved.revision !== settings.revision ||
-      saved.source_snapshot !== settings.source_snapshot || !sameJson(saved.zones, readback.zones) ||
-      saved.revision !== readback.revision || saved.source_snapshot !== readback.source_snapshot ||
-      !sameJson(saved.zones.map(z => z.tanks.map(t => t.id)), settings.zones.map(z => z.tanks.map(t => t.id))) ||
-      saved.zones.length !== draft.topology.zones.length) throw settingsError("readback_required");
-  const expected = draft.expected;
-  const previous = new Map(expected.zones.flatMap((z) => z.tanks.map((t) => [t.id, t])));
-  const original = new Map(baseline.zones.flatMap(z => z.tanks.map(t => [t.id, t.protected])));
-  const sameId = (prior, actual, ids) => prior === null ? !ids.has(actual) : prior === actual;
-  const priorZones = new Set(baseline.zones.map(z => z.id));
-  expected.zones = topologyShape(saved.zones).map((zone, zi) => {
-    const wanted = draft.topology.zones[zi];
-    if (!sameId(wanted.id, zone.id, priorZones) || zone.name !== wanted.name || zone.tanks.length !== wanted.tanks.length) {
-      throw settingsError("readback_required");
-    }
-    return { id: zone.id, name: zone.name, tanks: zone.tanks.map((tank, ti) => {
-      const requested = wanted.tanks[ti];
-      const protectedTank = saved.zones[zi].tanks[ti].protected;
-      if (!sameId(requested.id, tank.id, original) || !sameJson({ ...requested, id: tank.id }, tank) ||
-          protectedTank !== (original.get(tank.id) ?? false)) throw settingsError("readback_required");
-      const empty = { use_common: false, local: null, effective: null };
-      const prior = previous.get(tank.id) ?? { id: tank.id, scale_max_m: null, refill: empty, alarm: empty };
-      return { id: tank.id, name: tank.name, scale_max_m: prior.scale_max_m, refill: prior.refill, alarm: prior.alarm };
-    }) };
-  });
-  expected.revision = saved.revision;
-  expected.source_snapshot = saved.source_snapshot;
-  if (!sameJson(expected, settings)) throw settingsError("readback_required");
-}
 
 function settingsConflict(before, current) {
   if (before.revision !== current.revision) return "stale_revision";
   if (before.source_snapshot !== current.source_snapshot) return "stale_source";
 }
-
-const topologyLabels = (zones) => zones.map(({ id, name, tanks }) => [id, name, tanks.map(t => [t.id, t.name])]);
 
 const EDITOR_CSS = `
   :host { display:block; min-width:0; width:100%; }
@@ -1409,6 +1436,8 @@ const EDITOR_CSS = `
   .section { background:var(--secondary-background-color,#eef4f9); }
   .shared,.tank-settings,.apply-strip { background:var(--card-background-color,#fff); border:1px solid var(--divider-color,#cddce7); }
   .apply-strip { position:sticky; top:0; z-index:1; }
+  /* Stacked mobile actions must not cover fields reached by backward Tab. */
+  @media (max-width:600px) { .apply-strip { position:static; } }
   .affected { margin:0; padding-inline-start:1.25em; max-height:6em; overflow:auto; overflow-wrap:anywhere; }
   .editor-content,.zone-settings { display:grid; gap:10px; min-width:0; }
   ha-entity-picker { display:block; min-width:0; width:100%; }
@@ -1541,8 +1570,9 @@ function readyTransport([connection, socketReady, connected, callWS]) {
   return !!connection && socketReady !== false && connected === true && typeof callWS === "function";
 }
 
-class UninusWaterDashboardEditor extends HTMLElement {
+class UninusWaterQuickParameters extends HTMLElement {
   #hass;
+  #target;
   #principal = [];
   #transport = [];
   #configured = false;
@@ -1561,8 +1591,6 @@ class UninusWaterDashboardEditor extends HTMLElement {
   #conflict;
   #currentValues;
   #apply;
-  #openInventory;
-  #topology;
 
   constructor() {
     super();
@@ -1580,7 +1608,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#content.addEventListener("change", onDraft);
     const footer = element("div", "apply-strip");
     const info = element("p");
-    text(info, "套用會影響使用同一整合的所有卡片，不會操作設備。外層儲存只處理卡片；取消可丟棄尚未套用的草稿，但不能撤銷已套用的整合設定。");
+    text(info, "儲存會影響所有顯示此桶的卡片，不會操作設備或啟用自動補水。取消只丟棄未儲存草稿；已送出的請求不能撤銷。");
     this.#impact = element("p", "dim");
     this.#impactList = element("ul", "affected dim");
     this.#impactList.setAttribute("aria-label", "受影響水桶與設定差異");
@@ -1589,7 +1617,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#status.setAttribute("role", "status");
     const actions = element("div", "actions");
     this.#apply = button("apply");
-    text(this.#apply, "套用整合設定");
+    text(this.#apply, "儲存此桶參數");
     this.#apply.disabled = true;
     this.#apply.addEventListener("click", (event) => { if (event.isTrusted) void this.#save(); });
     this.#reload = button();
@@ -1603,11 +1631,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#currentValues = element("section", "section");
     this.#currentValues.setAttribute("aria-label", "整合目前設定（唯讀）");
     this.#currentValues.hidden = true;
-    this.#openInventory = button();
-    text(this.#openInventory, "編輯區域與水桶");
-    this.#openInventory.hidden = true;
-    this.#openInventory.addEventListener("click", (event) => { if (event.isTrusted) void this.#openTopology(); });
-    actions.append(this.#apply, this.#openInventory, this.#review, this.#reload);
+    actions.append(this.#apply, this.#review, this.#reload);
     footer.append(info, this.#impact, this.#impactList, this.#status, actions);
     shell.append(footer, this.#currentValues, this.#content);
     root.append(css, shell);
@@ -1615,7 +1639,14 @@ class UninusWaterDashboardEditor extends HTMLElement {
 
   setConfig(config) {
     if (config?.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
-    if (this.#configured) return;
+    const target = config.target;
+    if (!target || !matchesId(target.entry_id, ENTRY_ID) || !validInventoryId(target.zone_id) ||
+        !validInventoryId(target.tank_id) || !/^sensor\.[a-z0-9_]+$/.test(target.entity_id)) throw new Error("Invalid quick target");
+    if (this.#configured && sameJson(this.#target, target)) return;
+    this.#target = { ...target };
+    ++this.#epoch;
+    this.#needsRead = true;
+    this.#purge();
     this.#configured = true;
     this.#start();
   }
@@ -1625,10 +1656,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
     const principal = editorPrincipal(value);
     const transport = editorTransport(value);
     const changedPrincipal = !sameContext(principal, this.#principal);
-    if (!changedPrincipal && sameContext(transport, this.#transport)) {
-      for (const picker of this.#content.querySelectorAll("ha-entity-picker")) picker.hass = value;
-      return;
-    }
+    if (!changedPrincipal && sameContext(transport, this.#transport)) return;
     this.#principal = principal;
     this.#transport = transport;
     ++this.#epoch;
@@ -1647,6 +1675,9 @@ class UninusWaterDashboardEditor extends HTMLElement {
   disconnectedCallback() {
     ++this.#epoch;
     this.#needsRead = true;
+    this.#hass = undefined;
+    this.#principal = [];
+    this.#transport = [];
     this.#purge();
     text(this.#status, "");
   }
@@ -1668,7 +1699,6 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#conflict = undefined;
     this.#snapshot = undefined;
     this.#fields = undefined;
-    this.#topology = undefined;
     this.#clearCurrentValues();
     this.#content.replaceChildren();
     this.#updateDraft();
@@ -1688,6 +1718,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
     }
     if (rows.length > 1) throw settingsError("ambiguous_entry");
     if (!rows.length || (requireLoaded && rows[0].state !== "loaded")) throw settingsError("entry_not_loaded");
+    if (rows[0].entry_id !== this.#target.entry_id) throw settingsError("scope_changed");
     return rows[0].entry_id;
   }
 
@@ -1695,68 +1726,14 @@ class UninusWaterDashboardEditor extends HTMLElement {
     if (!this.#current(epoch)) throw settingsError("scope_changed");
     const value = await callWS({ type: `${DOMAIN}/config_get`, version: 1, entry_id: entry });
     if (!this.#current(epoch) || await this.#discover(callWS, epoch) !== entry) throw settingsError("scope_changed");
-    return readSettingsDto(value, entry);
-  }
-
-  async #readTopology(callWS, epoch, entry) {
-    if (!this.#current(epoch)) throw settingsError("scope_changed");
-    const value = await callWS({ type: `${DOMAIN}/topology_get`, version: 1, entry_id: entry });
-    if (!this.#current(epoch) || await this.#discover(callWS, epoch) !== entry) throw settingsError("scope_changed");
-    return readTopologyDto(value, entry);
-  }
-
-  async #loadPicker() {
-    if (customElements.get("ha-entity-picker")) return;
-    // HA lazy-loads picker code through its own selector. Don't import a
-    // version-specific frontend bundle or touch Lovelace's dialog internals.
-    if (!customElements.get("ha-selector")) throw settingsError("topology_picker_unavailable");
-    const loader = element("ha-selector");
-    loader.hass = this.#hass;
-    loader.hidden = true;
-    loader.disabled = true;
-    loader.selector = { entity: { filter: [{ domain: "sensor" }] } };
-    this.#content.append(loader);
-    let timeout;
-    try {
-      await Promise.race([customElements.whenDefined("ha-entity-picker"), new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(settingsError("topology_picker_unavailable")), 5000);
-      })]);
-    } finally {
-      clearTimeout(timeout);
-      loader.remove();
+    const settings = readSettingsDto(value, entry);
+    if (!settings.zones.some(zone => zone.id === this.#target.zone_id && zone.tanks.some(tank => tank.id === this.#target.tank_id))) {
+      throw settingsError("scope_changed");
     }
+    return settings;
   }
 
-  async #openTopology() {
-    const epoch = this.#epoch;
-    if (!this.#current(epoch) || this.#flight || this.#topology) return;
-    const flight = this.#flight = {};
-    const callWS = this.#transport[3].bind(this.#hass);
-    this.#updateDraft();
-    try {
-      const entry = await this.#discover(callWS, epoch, false);
-      const topology = await this.#readTopology(callWS, epoch, entry);
-      if (!this.#current(epoch)) return;
-      const baseline = this.#snapshot ?? await this.#read(callWS, epoch, entry);
-      if (!this.#current(epoch) || entry !== baseline.entry_id) throw settingsError("scope_changed");
-      const conflict = settingsConflict(baseline, topology);
-      if (conflict) throw settingsError(conflict);
-      await this.#loadPicker();
-      if (!this.#current(epoch)) return;
-      if (!this.#snapshot) {
-        this.#needsRead = false;
-        this.#mountSettings(baseline);
-      }
-      this.#setTopology(topology);
-      text(this.#status, "");
-    } catch (error) {
-      this.#issue(error, epoch, undefined, true);
-    } finally {
-      this.#finish(flight, epoch);
-    }
-  }
-
-  #issue(error, epoch, write, requestedTopology = !!this.#topology) {
+  #issue(error, epoch, write) {
     if (!this.#current(epoch)) return;
     const code = error?.code;
     if (["unauthorized", "entry_not_loaded", "ambiguous_entry", "scope_changed"].includes(code)) this.#purge();
@@ -1768,7 +1745,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
       Object.hasOwn(SETTINGS_MESSAGES, code) ? SETTINGS_MESSAGES[code] : "無法讀取或套用整合設定，請重新讀取後核對。";
     const stale = code === "stale_revision" || code === "stale_source";
     if ((write || stale) && this.#snapshot) this.#problem = message;
-    if (stale && this.#snapshot) this.#conflict = { topology: requestedTopology };
+    if (stale && this.#snapshot) this.#conflict = {};
     text(this.#status, message);
   }
 
@@ -1785,8 +1762,6 @@ class UninusWaterDashboardEditor extends HTMLElement {
     const flight = this.#flight = {};
     const callWS = this.#transport[3].bind(this.#hass);
     if (!review) this.#needsRead = true;
-    const reopenTopology = !!this.#topology;
-    const rereadTopology = reopenTopology || !!this.#conflict?.topology && !discard;
     const draft = this.#draft();
     if (discard || (!this.#problem && draft?.valid && !draft.dirty)) this.#purge();
     this.#clearCurrentValues();
@@ -1799,45 +1774,21 @@ class UninusWaterDashboardEditor extends HTMLElement {
         if (review) throw settingsError("scope_changed");
         this.#purge();
       }
-      const topology = rereadTopology ? await this.#readTopology(callWS, epoch, entry) : undefined;
       const snapshot = await this.#read(callWS, epoch, entry);
       if (!this.#current(epoch)) return;
-      if (topology) {
-        const split = settingsConflict(snapshot, topology);
-        if (split && this.#snapshot && !discard) {
-          // The current transport has revalidated both responses and their scope,
-          // but they cannot be combined. Display only the retained draft; a new
-          // explicit review must obtain a coherent pair before showing current values.
-          this.#needsRead = false;
-          this.#conflict = { topology: true };
-          const reason = split === "stale_source" ? "水桶來源已變更" : "設定已被變更";
-          const notice = `${reason}；兩次讀取不一致。草稿已保留，請再次讀取目前設定。`;
-          if (this.#problem === SETTINGS_MESSAGES.readback_required) {
-            text(this.#status, `${this.#problem} ${notice}`);
-          } else {
-            this.#problem = notice;
-            text(this.#status, notice);
-          }
-          return;
-        }
-        if (split || !sameJson(topologyLabels(snapshot.zones), topologyLabels(topology.zones))) {
-          throw settingsError("invalid_readback");
-        }
-      }
       const baseline = this.#snapshot;
       this.#needsRead = false;
       if (!baseline) {
         this.#mountSettings(snapshot);
-        if (topology && reopenTopology) this.#setTopology(topology);
       }
       // A same-owner read may unlock the draft; it cannot replace either CAS token.
       else {
         const code = settingsConflict(baseline, snapshot);
         if (!this.#problem && code) {
-          this.#conflict = { topology: !!topology };
+          this.#conflict = {};
           this.#problem = SETTINGS_MESSAGES[code];
         }
-        if (this.#conflict) this.#showCurrentValues(snapshot, topology);
+        if (this.#conflict) this.#showCurrentValues(snapshot);
       }
       text(this.#status, this.#problem ?? "");
     } catch (error) {
@@ -1855,7 +1806,7 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#currentValues.replaceChildren();
   }
 
-  #showCurrentValues(settings, topology) {
+  #showCurrentValues(settings) {
     const line = (copy, tag = "p") => {
       const node = element(tag);
       text(node, copy);
@@ -1863,16 +1814,17 @@ class UninusWaterDashboardEditor extends HTMLElement {
     };
     const current = this.#currentValues;
     current.replaceChildren(line("整合目前設定（唯讀）", "h2"),
-      line("原草稿保留在下方，不能直接重送。核對後請捨棄草稿，再重新輸入或明確選擇綁定。"));
+      line("原草稿保留在下方，不能直接重送。核對後請捨棄草稿，再重新輸入此桶參數。"));
     const original = this.#snapshot;
     if (original.revision !== settings.revision && original.source_snapshot !== settings.source_snapshot) {
       current.append(line("設定版本與水桶來源都已變更。"));
     }
-    for (const kind of policyKinds) current.append(line(`共用${POLICY[kind].label}：${settingsPairText(kind, settings.common[kind])}`));
-    const bindings = new Map(topology?.zones.flatMap(z => z.tanks.map(t => [t.id, t])));
+    for (const kind of policyKinds) current.append(line(`共用${POLICY[kind].label}（唯讀）：${settingsPairText(kind, settings.common[kind])}`));
     for (const [zi, zone] of settings.zones.entries()) {
+      if (zone.id !== this.#target.zone_id) continue;
       current.append(line(`第 ${zi + 1} 區 · ${zone.name}`, "h3"));
       for (const [ti, tank] of zone.tanks.entries()) {
+        if (tank.id !== this.#target.tank_id) continue;
         const summary = element("div", "tank-settings");
         summary.append(line(`第 ${ti + 1} 桶 · ${tank.name}`, "h4"),
           line(`水位顯示量程：${tank.scale_max_m === null ? "未設定" : `${tank.scale_max_m} m`}`));
@@ -1881,11 +1833,6 @@ class UninusWaterDashboardEditor extends HTMLElement {
           summary.append(line(`${POLICY[kind].label}（${use_common ? "共用" : "個別"}）：${settingsPairText(kind, effective)}${
             use_common ? `；保留的個別值：${settingsPairText(kind, local)}` : ""}`));
         }
-        const bound = bindings.get(tank.id);
-        if (bound) for (const [role, label] of Object.entries(TOPOLOGY_ROLES)) {
-          const binding = bound[role];
-          summary.append(line(`${label}：${binding ? binding.entity_id ?? UNAVAILABLE_BINDING : "未設定"}`));
-        }
         current.append(summary);
       }
     }
@@ -1893,40 +1840,27 @@ class UninusWaterDashboardEditor extends HTMLElement {
   }
 
   #mountSettings(snapshot) {
-    this.#topology = undefined;
     const section = element("section", "section");
     const title = element("h2");
     text(title, "補水參數");
-    const shared = element("section", "shared");
-    const sharedTitle = element("h3");
-    text(sharedTitle, "共用門檻與套用影響");
-    const note = element("p", "dim");
-    text(note, "共用值只影響選用該項共用設定的水桶；清除一組門檻時，請清空該組兩欄。");
-    const sharedGrid = element("div", "shared-grid");
-    const common = {};
-    for (const kind of policyKinds) {
-      common[kind] = pairFields(kind, snapshot.common[kind]);
-      sharedGrid.append(common[kind].frame);
-    }
-    shared.append(sharedTitle, note, sharedGrid);
-
     const inventory = element("section", "section");
     const heading = element("h2");
     text(heading, "區域與水桶");
     const help = element("p", "dim");
     const link = element("a");
-    text(help, "在此編輯區桶草稿；安全驗證及已啟用控制的換綁仍由原生整合設定處理。");
+    text(help, "只編輯此桶參數。區桶名稱、來源綁定與安全啟用請使用原生整合設定。");
     text(link, "前往原生整合安全設定");
     link.href = OPTIONS_PATH;
-    const topology = element("div", "editor-content");
-    inventory.append(heading, help, link, topology);
+    inventory.append(heading, help, link);
     const tanks = new Map();
     for (const zone of snapshot.zones) {
+      if (zone.id !== this.#target.zone_id) continue;
       const group = element("section", "zone-settings");
       const name = element("h3");
       text(name, `${zone.name} · ${zone.tanks.length} 桶`);
       group.append(name);
       for (const [index, tank] of zone.tanks.entries()) {
+        if (tank.id !== this.#target.tank_id) continue;
         const row = element("section", "tank-settings");
         row.dataset.tankId = tank.id;
         const tankName = element("h4");
@@ -1951,177 +1885,25 @@ class UninusWaterDashboardEditor extends HTMLElement {
       }
       inventory.append(group);
     }
-    section.append(title, shared, inventory);
+    section.append(title, inventory);
     this.#snapshot = snapshot;
-    this.#fields = { common, tanks, topology };
+    this.#fields = { tanks };
     this.#content.replaceChildren(section);
     this.#updateDraft();
-  }
-
-  #setTopology(baseline) {
-    const groups = element("div", "editor-content");
-    const removal = element("fieldset");
-    const legend = element("legend");
-    text(legend, "移除範圍確認");
-    const list = element("ul");
-    const confirm = element("input");
-    confirm.type = "checkbox";
-    removal.append(legend, list, labeledControl("確認移除以上區域及水桶", confirm));
-    removal.hidden = true;
-    this.#topology = { baseline, zones: structuredClone(baseline.zones), groups, removal, list, confirm };
-    this.#fields.topology.replaceChildren(groups, removal);
-    this.#renderTopology();
-  }
-
-  #renderTopology() {
-    const draft = this.#topology;
-    if (!draft) return;
-    const { groups, zones, baseline } = draft;
-    const blank = () => ({ id: null, name: "", protected: false, level_sensor: null, refill_switch: null, alarm_switch: null });
-    const action = (label, callback, fixed = false) => {
-      const node = button();
-      text(node, label);
-      node.dataset.topologyAction = fixed ? "fixed" : "editable";
-      node.addEventListener("click", (event) => {
-        if (!event.isTrusted || !node.isConnected || !this.#current(this.#epoch) || this.#topology !== draft ||
-            this.#flight || this.#needsRead || this.#problem) return;
-        callback();
-        this.#renderTopology();
-        this.#updateDraft();
-      });
-      return node;
-    };
-    const nameField = (label, row) => {
-      const input = element("input");
-      input.type = "text";
-      input.value = row.name;
-      input.addEventListener("input", () => { row.name = input.value; });
-      return labeledControl(label, input);
-    };
-    const candidates = new Map(baseline.candidates.map((row) => [row.entity_id, row]));
-    const zoneControls = zones.map((zone, zi) => {
-      const group = element("fieldset", "zone-settings");
-      const title = element("legend");
-      text(title, `第 ${zi + 1} 區`);
-      group.append(title, nameField("區域名稱", zone));
-      for (const [ti, tank] of zone.tanks.entries()) {
-        const tankGroup = element("fieldset", "tank-settings");
-        const tankTitle = element("legend");
-        text(tankTitle, `第 ${ti + 1} 桶`);
-        tankGroup.append(tankTitle, nameField("水桶名稱", tank));
-        for (const [role, label] of Object.entries(TOPOLOGY_ROLES)) {
-          const picker = element("ha-entity-picker");
-          const domain = role === "level_sensor" ? "sensor" : "switch";
-          const allowed = baseline.candidates.filter(r => r.entity_id.startsWith(`${domain}.`)).map(r => r.entity_id);
-          picker.dataset.role = role;
-          picker.dataset.protected = String(tank.protected);
-          picker.hass = this.#hass;
-          picker.label = label;
-          picker.required = role === "level_sensor";
-          picker.includeDomains = [domain];
-          picker.includeEntities = allowed;
-          picker.showEntityId = true;
-          const unavailable = element("p", "dim");
-          text(unavailable, `${label}：${UNAVAILABLE_BINDING}。`);
-          const clear = role === "level_sensor" || tank.protected ? undefined :
-            action(`清除無法使用的${label}`, () => { tank[role] = null; });
-          const showBinding = () => {
-            picker.value = tank[role]?.entity_id ?? undefined;
-            unavailable.hidden = tank[role]?.entity_id !== null;
-            if (clear) clear.hidden = unavailable.hidden;
-          };
-          showBinding();
-          picker.addEventListener("value-changed", (event) => {
-            event.stopPropagation();
-            const old = tank[role];
-            if (picker.isConnected && !picker.disabled && this.#current(this.#epoch) && this.#topology === draft &&
-                !this.#flight && !this.#needsRead && !this.#problem) {
-              const value = event.detail?.value;
-              if (!value && old?.entity_id !== null) tank[role] = null;
-              else if (value !== old?.entity_id && allowed.includes(value)) tank[role] = candidates.get(value);
-            }
-            showBinding();
-            this.#updateDraft();
-          });
-          tankGroup.append(picker, unavailable);
-          if (clear) tankGroup.append(clear);
-        }
-        const help = element("p", "dim");
-        if (tank.protected) {
-          text(help, "此水桶已啟用受保護控制。僅可改名；換綁或移除前，請前往原生整合安全設定。");
-        } else if (zone.tanks.length === 1) {
-          text(help, "每區須保留至少一桶；如有其他區域，可以移除此區。");
-        }
-        tankGroup.append(help, action("移除水桶", () => zone.tanks.splice(ti, 1), tank.protected || zone.tanks.length === 1));
-        group.append(tankGroup);
-      }
-      group.append(action("新增水桶", () => zone.tanks.push(blank())),
-        action("移除區域", () => zones.splice(zi, 1), zones.length === 1 || zone.tanks.some(t => t.protected)));
-      return group;
-    });
-    groups.replaceChildren(...zoneControls, action("新增區域", () => zones.push({ id: null, name: "", tanks: [blank()] })));
-  }
-
-  #topologyDraft() {
-    const draft = this.#topology;
-    if (!draft) return;
-    const before = draft.baseline.zones;
-    const zones = topologyShape(draft.zones);
-    const zoneIds = new Set(zones.map(z => z.id));
-    const tankIds = new Set(zones.flatMap(z => z.tanks.map(t => t.id)));
-    const removedZones = before.filter(z => !zoneIds.has(z.id));
-    const removedTanks = before.flatMap(z => z.tanks.filter(t => !tankIds.has(t.id)).map(t => [z, t]));
-    const remove = { zones: removedZones.map(z => z.id).sort(), tanks: removedTanks.map(([, t]) => t.id).sort() };
-    const labels = [
-      ...removedZones.map(z => `區域：${z.name}（第 ${before.indexOf(z) + 1} 區）`),
-      ...removedTanks.map(([z, t]) => `水桶：${z.name}（第 ${before.indexOf(z) + 1} 區） · ${t.name}（第 ${z.tanks.indexOf(t) + 1} 桶）`),
-    ];
-    const key = JSON.stringify(remove);
-    if (key !== draft.removalKey) {
-      draft.removalKey = key;
-      draft.confirm.checked = false;
-      draft.removal.hidden = labels.length === 0;
-      draft.list.replaceChildren(...labels.map(label => {
-        const li = element("li");
-        text(li, label);
-        return li;
-      }));
-    }
-    const validName = (name, old) => name === old || (topologyName(name) && name === name.trim() &&
-      [...name].length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/u.test(name));
-    let valid = !labels.length || draft.confirm.checked;
-    for (const z of zones) {
-      const previous = before.find(old => old.id === z.id);
-      valid &&= validName(z.name, previous?.name) && z.tanks.every(t => t.level_sensor &&
-        validName(t.name, previous?.tanks.find(old => old.id === t.id)?.name));
-    }
-    return { valid, zones, remove, tankIds, changed: !sameJson(zones, topologyShape(before)), labels };
   }
 
   #draft() {
     const snapshot = this.#snapshot;
     const fields = this.#fields;
     if (!snapshot || !fields) return;
-    const common = {};
     const expected = structuredClone(snapshot);
-    const topology = this.#topologyDraft();
-    let valid = topology?.valid ?? true;
+    let valid = true;
     const uses = { refill: 0, alarm: 0 };
     const affected = [];
     const rows = [];
-    for (const kind of policyKinds) {
-      const input = fields.common[kind];
-      const { pair, valid: pairValid } = draftPair(kind, input, snapshot.common[kind]);
-      valid &&= pairValid;
-      text(input.draft, !pairValid ? "請輸入完整且有效的門檻。" : "");
-      if (pairValid && !samePair(pair, snapshot.common[kind])) common[kind] = pair;
-      expected.common[kind] = pairValid ? pair : null;
-    }
     snapshot.zones.forEach((zone, z) => zone.tanks.forEach((tank, t) => {
       const field = fields.tanks.get(tank.id);
-      const removed = topology && !topology.tankIds.has(tank.id);
-      field.row.hidden = !!removed;
-      if (removed) return;
+      if (!field) return;
       const { inputs, scale, savedScaleText, target } = field;
       const next = expected.zones[z].tanks[t];
       const row = { id: tank.id };
@@ -2165,10 +1947,8 @@ class UninusWaterDashboardEditor extends HTMLElement {
       if (differences.length) affected.push(`${target}：${differences.join("；")}`);
     }));
     const changes = {};
-    if (Object.keys(common).length) changes.common = common;
     if (rows.length) changes.tanks = rows;
-    return { valid, changes, expected, uses, affected, topology,
-      dirty: !!topology?.changed || Object.keys(changes).length !== 0 };
+    return { valid, changes, expected, uses, affected, dirty: Object.keys(changes).length !== 0 };
   }
 
   #updateDraft() {
@@ -2179,14 +1959,11 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#reload.disabled = !!this.#flight;
     this.#review.hidden = !this.#conflict || this.#reload.hidden || !this.#current(this.#epoch);
     this.#review.disabled = !!this.#flight;
-    this.#openInventory.hidden = !this.#current(this.#epoch) || !!this.#topology;
-    this.#openInventory.disabled = !!this.#flight || !!this.#problem;
-    for (const control of this.#content.querySelectorAll("input,select,ha-entity-picker,[data-topology-action]")) {
-      const disabled = waiting || !!this.#conflict || control.dataset.protected === "true" || control.dataset.topologyAction === "fixed" ||
-        (control.dataset.topologyAction !== undefined || control.localName === "ha-entity-picker") && !!this.#problem;
+    for (const control of this.#content.querySelectorAll("input,select")) {
+      const disabled = waiting || !!this.#conflict;
       if (control.disabled !== disabled) control.disabled = disabled;
     }
-    text(this.#impact, draft && !this.#needsRead ? `參數影響 ${draft.affected.length} 桶 · 共用補水 ${draft.uses.refill} 桶 · 共用低液位告警 ${draft.uses.alarm} 桶${draft.topology?.changed ? " · 區桶或綁定有變更" : ""}${draft.valid ? "" : " · 請填寫有效欄位並確認移除範圍"}` : "");
+    text(this.#impact, draft && !this.#needsRead ? `參數影響 ${draft.affected.length} 桶 · 共用補水 ${draft.uses.refill} 桶 · 共用低液位告警 ${draft.uses.alarm} 桶${draft.valid ? "" : " · 請填寫有效欄位"}` : "");
     const affected = this.#needsRead ? [] : draft?.affected ?? [];
     this.#impactList.hidden = !affected.length;
     const items = [...this.#impactList.children];
@@ -2205,7 +1982,6 @@ class UninusWaterDashboardEditor extends HTMLElement {
     const baseline = this.#snapshot;
     const draft = this.#draft();
     if (!draft?.valid || !draft.dirty) return;
-    const topologyBaseline = this.#topology?.baseline;
     const flight = this.#flight = { baseline, sent: false };
     const callWS = this.#transport[3].bind(this.#hass);
     this.#updateDraft();
@@ -2215,28 +1991,17 @@ class UninusWaterDashboardEditor extends HTMLElement {
       if (!this.#current(epoch)) return;
       if (entry !== baseline.entry_id) throw settingsError("scope_changed");
       flight.sent = true;
-      const isTopology = !!draft.topology?.changed;
-      const result = await callWS({ type: `${DOMAIN}/${isTopology ? "topology_save" : "config_save"}`, version: 1, entry_id: entry,
-        if_revision: baseline.revision, if_source_snapshot: baseline.source_snapshot, changes: draft.changes,
-        ...(isTopology ? { zones: draft.topology.zones, remove: draft.topology.remove } : {}) });
+      const result = await callWS({ type: `${DOMAIN}/config_save`, version: 1, entry_id: entry,
+        if_revision: baseline.revision, if_source_snapshot: baseline.source_snapshot, changes: draft.changes });
       if (!this.#current(epoch)) return;
-      const saved = isTopology ? readTopologyDto(result, entry) : readSettingsDto(result, entry);
+      const saved = readSettingsDto(result, entry);
       const readback = await this.#read(callWS, epoch, entry);
       if (!this.#current(epoch)) return;
-      if (isTopology) {
-        const topology = await this.#readTopology(callWS, epoch, entry);
-        if (!this.#current(epoch)) return;
-        verifyTopologySave(draft, saved, readback, topology, topologyBaseline);
-        this.#mountSettings(readback);
-        this.#setTopology(topology);
-      } else {
-        draft.expected.revision = saved.revision;
-        if (saved.revision === baseline.revision || !sameJson(saved, draft.expected) || !sameJson(readback, saved)) {
-          throw settingsError("readback_required");
-        }
-        this.#mountSettings(readback);
-        if (topologyBaseline) this.#setTopology({ ...topologyBaseline, revision: saved.revision });
+      draft.expected.revision = saved.revision;
+      if (saved.revision === baseline.revision || !sameJson(saved, draft.expected) || !sameJson(readback, saved)) {
+        throw settingsError("readback_required");
       }
+      this.#mountSettings(readback);
       text(this.#status, APPLIED);
     } catch (error) {
       this.#issue(error, epoch, flight);
@@ -2246,7 +2011,78 @@ class UninusWaterDashboardEditor extends HTMLElement {
   }
 }
 
+function displayConfig(config) {
+  if (config?.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
+  for (const key of ["zone_ids", "tank_ids"]) {
+    if (config[key] !== undefined && (!Array.isArray(config[key]) || !config[key].every(validInventoryId))) {
+      throw new Error(`Invalid ${key}`);
+    }
+  }
+  if (config.show_details !== undefined && typeof config.show_details !== "boolean") throw new Error("Invalid show_details");
+  return { ...config, zone_ids: [...new Set(config.zone_ids ?? [])], tank_ids: [...new Set(config.tank_ids ?? [])],
+    show_details: config.show_details ?? false };
+}
+
+class UninusWaterDashboardEditor extends HTMLElement {
+  #hass;
+  #config;
+  #content;
+  #signature;
+
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: "open" });
+    const css = element("style"); css.textContent = EDITOR_CSS;
+    this.#content = element("section", "settings section");
+    root.append(css, this.#content);
+  }
+
+  setConfig(config) { this.#config = displayConfig(config); this.#signature = undefined; this.#render(); }
+  set hass(value) { this.#hass = value; this.#render(); }
+  connectedCallback() { this.#render(); }
+
+  #change(key, value) {
+    this.#config = { ...this.#config, [key]: value };
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: structuredClone(this.#config) }, bubbles: true, composed: true }));
+  }
+
+  #render() {
+    if (!this.#config) return;
+    const zones = zonesFrom(this.#hass?.states ?? {});
+    const signature = JSON.stringify([zones, this.#config]);
+    if (signature === this.#signature) return;
+    this.#signature = signature;
+    const heading = element("h2"); text(heading, "本卡顯示設定");
+    const help = element("p", "dim"); text(help, "未選區域或水桶代表顯示全部可讀項目。只修改本卡顯示；參數請在日常卡片開啟快捷參數，設備與安全設定請使用整合設定。");
+    const checkbox = (label, checked, change) => {
+      const input = element("input"); input.type = "checkbox"; input.checked = checked;
+      input.addEventListener("change", () => change(input.checked));
+      return labeledControl(label, input);
+    };
+    const details = checkbox("顯示詳細狀態", this.#config.show_details, value => this.#change("show_details", value));
+    const fields = [heading, help, details];
+    for (const [key, title, items] of [
+      ["zone_ids", "顯示區域", zones],
+      ["tank_ids", "顯示水桶", zones.flatMap(zone => zone.tanks.map(tank => ({ ...tank, name: `${zone.name} · ${tank.name}` })))],
+    ]) {
+      const group = element("fieldset"); const legend = element("legend"); text(legend, title); group.append(legend);
+      for (const item of items) group.append(checkbox(item.name, this.#config[key].includes(item.id), checked => {
+        const ids = this.#config[key].filter(id => id !== item.id);
+        if (checked) ids.push(item.id);
+        this.#change(key, ids);
+      }));
+      // Retain offline selections without silently deleting saved card config.
+      for (const id of this.#config[key].filter(id => !items.some(item => item.id === id))) {
+        group.append(checkbox(`目前無法讀取 · ${id}`, true, checked => { if (!checked) this.#change(key, this.#config[key].filter(value => value !== id)); }));
+      }
+      fields.push(group);
+    }
+    this.#content.replaceChildren(...fields);
+  }
+}
+
 if (!customElements.get(EDITOR_TAG)) customElements.define(EDITOR_TAG, UninusWaterDashboardEditor);
+if (!customElements.get(`${TAG}-quick-parameters`)) customElements.define(`${TAG}-quick-parameters`, UninusWaterQuickParameters);
 if (!customElements.get(TAG)) customElements.define(TAG, UninusWaterDashboard);
 const picker = window.customCards ??= [];
 if (!picker.some((card) => card.type === TAG)) {

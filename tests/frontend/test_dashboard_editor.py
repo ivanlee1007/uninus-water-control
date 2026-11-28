@@ -1,4 +1,4 @@
-"""Trusted Chromium coverage of the shipped card editor with a controlled WS peer."""
+"""Trusted Chromium coverage of per-tank Quick parameters with a controlled WS peer."""
 
 import pytest
 
@@ -11,7 +11,7 @@ SETUP = """() => {
     window.entry = '01K00A00000000000000000000';
     const zone = id(1), tank = id(2);
     window.server = {version:1, entry_id:entry, revision:'a'.repeat(64), source_snapshot:'b'.repeat(64),
-        common:{refill:null, alarm:null}, zones:[{id:zone,name:'東區',tanks:[{id:tank,name:'試驗桶',
+        common:{refill:[0.5,1.5], alarm:null}, zones:[{id:zone,name:'東區',tanks:[{id:tank,name:'試驗桶',
            refill:{use_common:false,local:[0.4,1.6],effective:[0.4,1.6]},
            alarm:{use_common:false,local:[0.2,5],effective:[0.2,5]},scale_max_m:null}]}]};
     window.wire = [];
@@ -37,10 +37,10 @@ SETUP = """() => {
     window.hass = {user:{id:'admin',is_admin:true}, connected:true, connection:{connected:true},
         callWS:ws, states:{'sensor.public':{attributes:{uninus_water_settings_entry:'not a scope source'}}}};
     window.mount = () => {
-        const editor = cls.getConfigElement?.();
+        const editor = document.createElement('uninus-water-dashboard-quick-parameters');
         if (!editor) return;
         editor.hass = hass;
-        editor.setConfig({type});
+        editor.setConfig({type,target:{entry_id:entry,zone_id:id(1),tank_id:id(2),entity_id:'sensor.p2'}});
         document.querySelector('#area').append(editor);
         return editor;
     };
@@ -51,16 +51,16 @@ SETUP = """() => {
 def test_native_editor_drafts_require_explicit_apply_and_readback(browser_page):
     page = browser_page
     page.evaluate(SETUP)
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）", exact=True)
-    common = page.get_by_role("group", name="共用補水門檻", exact=True)
+    common = page.get_by_role("group", name="補水門檻", exact=True)
     page.get_by_role("heading", name="補水參數", exact=True).wait_for()
     assert apply.is_disabled()
     scale.press_sequentially("2.75")
     page.evaluate("""() => {
         window.input = editor.shadowRoot.activeElement;
         editor.hass = {...hass, states:{'sensor.Elsewhere':{state:'ready'}}};
-        editor.setConfig({type:'custom:uninus-water-dashboard'});
+        editor.setConfig({type:'custom:uninus-water-dashboard',target:{entry_id:entry,zone_id:id(1),tank_id:id(2),entity_id:'sensor.p2'}});
     }""")
     assert page.evaluate("editor.shadowRoot.activeElement === input")
     assert scale.input_value() == "2.75"
@@ -68,8 +68,6 @@ def test_native_editor_drafts_require_explicit_apply_and_readback(browser_page):
     page.evaluate("() => { editor.remove(); window.editor = mount(); }")
     scale.wait_for()
     assert scale.input_value() == ""
-    common.get_by_role("spinbutton", name="下限（m）").fill("0.5")
-    common.get_by_role("spinbutton", name="上限（m）").fill("1.5")
     page.get_by_role("combobox", name="補水門檻模式").select_option("common")
     assert page.get_by_role("combobox", name="低液位告警模式").input_value() == "local"
     scale.fill("2.75")
@@ -79,13 +77,13 @@ def test_native_editor_drafts_require_explicit_apply_and_readback(browser_page):
     assert "0.4／1.6 m → 0.5／1.5 m" in impact.inner_text()
     assert "未設定 → 2.75 m" in impact.inner_text()
     apply.click()
-    page.get_by_text("已套用；不必再按外層儲存。", exact=True).wait_for()
+    page.get_by_text("已儲存並重新讀回確認。", exact=True).wait_for()
     writes = page.evaluate("wire.filter(x => x.type.endsWith('/config_save'))")
     assert len(writes) == 1
     assert writes[0] == {
         "type": "uninus_water_control/config_save", "version": 1,
         "entry_id": page.evaluate("entry"), "if_revision": "a" * 64, "if_source_snapshot": "b" * 64,
-        "changes": {"common": {"refill": [0.5, 1.5]}, "tanks": [{"id": "0" * 31 + "2",
+        "changes": {"tanks": [{"id": "0" * 31 + "2",
                      "refill": {"use_common": True}, "scale_max_m": 2.75}]},
     }
     assert page.evaluate("wire.at(-1).type") == "config_entries/get"
@@ -100,7 +98,7 @@ def test_native_editor_rejects_ambiguous_or_replaced_authority(browser_page):
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）", exact=True)
     scale.fill("2")
     page.evaluate("entries.push({...entries[0],entry_id:'01K00A00000000000000000001'})")
-    page.get_by_role("button", name="套用整合設定", exact=True).click()
+    page.get_by_role("button", name="儲存此桶參數", exact=True).click()
     page.get_by_text("找到多筆補水整合，無法安全選定設定範圍。", exact=True).wait_for()
     assert not scale.count()
     assert not page.evaluate("wire.some(x => x.type.endsWith('/config_save'))")
@@ -118,10 +116,12 @@ def test_native_editor_rejects_ambiguous_or_replaced_authority(browser_page):
 def test_invalid_policy_or_unset_common_cannot_apply(browser_page):
     page = browser_page
     page.evaluate(SETUP)
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
-    alarm = page.get_by_role("group", name="共用低液位告警", exact=True)
-    page.get_by_role("combobox", name="低液位告警模式").select_option("common")
-    assert apply.is_disabled()
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
+    alarm = page.get_by_role("group", name="低液位告警", exact=True)
+    mode = page.get_by_role("combobox", name="低液位告警模式")
+    mode.select_option("common")
+    assert apply.is_disabled()  # A missing inherited default must never be fabricated.
+    mode.select_option("local")
     alarm.get_by_role("spinbutton", name="低位門檻（m）").fill("0.25")
     alarm.get_by_role("spinbutton", name="延遲（秒）").fill("1.5")
     assert apply.is_disabled()
@@ -132,23 +132,22 @@ def test_invalid_policy_or_unset_common_cannot_apply(browser_page):
     scale.fill("")
     assert apply.is_enabled()
     apply.click()
-    page.get_by_text("已套用；不必再按外層儲存。", exact=True).wait_for()
+    page.get_by_text("已儲存並重新讀回確認。", exact=True).wait_for()
     changes = page.evaluate("wire.find(x=>x.type.endsWith('/config_save')).changes")
-    assert changes["common"] == {"alarm": [0.25, 1]}
-    assert changes["tanks"] == [{"id": "0" * 31 + "2", "alarm": {"use_common": True}}]
+    assert changes == {"tanks": [{"id": "0" * 31 + "2", "alarm": {"local": [0.25, 1]}}]}
     assert page.get_by_role("combobox", name="補水門檻模式").input_value() == "local"
-    page.get_by_role("combobox", name="低液位告警模式").select_option("local")
-    assert page.get_by_role("group", name="低液位告警", exact=True).get_by_role(
-        "spinbutton", name="延遲（秒）", exact=True
-    ).input_value() == "5"
+    mode.select_option("common")
+    assert apply.is_disabled()
+    mode.select_option("local")
+    assert alarm.get_by_role("spinbutton", name="延遲（秒）", exact=True).input_value() == "1"
 
 
 def test_editor_rejects_lossy_numeric_draft_without_dispatch(browser_page):
     page = browser_page
     page.evaluate(SETUP)
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）")
-    refill = page.get_by_role("group", name="共用補水門檻", exact=True)
+    refill = page.get_by_role("group", name="補水門檻", exact=True)
     lower = refill.get_by_role("spinbutton", name="下限（m）")
     upper = refill.get_by_role("spinbutton", name="上限（m）")
     lower.fill("0.1")
@@ -162,10 +161,9 @@ def test_editor_rejects_lossy_numeric_draft_without_dispatch(browser_page):
     assert apply.is_enabled()
     assert not page.evaluate("wire.some(x => x.type.endsWith('/config_save'))")
     apply.click()
-    page.get_by_text("已套用；不必再按外層儲存。", exact=True).wait_for()
+    page.get_by_text("已儲存並重新讀回確認。", exact=True).wait_for()
     writes = page.evaluate("wire.filter(x => x.type.endsWith('/config_save'))")
-    assert [row["changes"] for row in writes] == [{"common": {"refill": [0.1, 1.125]},
-        "tanks": [{"id": "0" * 31 + "2", "scale_max_m": 2.75}]}]
+    assert [row["changes"] for row in writes] == [{"tanks": [{"id": "0" * 31 + "2", "refill": {"local": [0.1, 1.125]}, "scale_max_m": 2.75}]}]
 
 
 def test_stale_save_and_wrong_readback_do_not_rebase_or_retry(browser_page):
@@ -187,7 +185,7 @@ def test_stale_save_and_wrong_readback_do_not_rebase_or_retry(browser_page):
         editor.hass = hass;
     }""")
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）")
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale.fill("2.5")
     apply.click()
     page.get_by_text("設定已被變更；請重新讀取並核對後再修改。本次草稿未套用。", exact=True).wait_for()
@@ -201,7 +199,7 @@ def test_stale_save_and_wrong_readback_do_not_rebase_or_retry(browser_page):
     apply.click()
     page.get_by_text("無法確認是否已套用；請重新讀取並核對，不要重送草稿。", exact=True).wait_for()
     assert apply.is_disabled() and scale.input_value() == "2.75"
-    assert not page.get_by_text("已套用；不必再按外層儲存。", exact=True).count()
+    assert not page.get_by_text("已儲存並重新讀回確認。", exact=True).count()
     assert page.evaluate("wire.filter(x=>x.type.endsWith('/config_save')).length") == 2
 
 
@@ -209,7 +207,7 @@ def test_same_principal_reconnect_keeps_draft_and_original_cas(browser_page):
     page = browser_page
     page.evaluate(SETUP)
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）")
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale.press_sequentially("2.75")
     draft = scale.element_handle()
     page.evaluate("""() => {
@@ -239,7 +237,7 @@ def test_same_principal_reconnect_keeps_draft_and_original_cas(browser_page):
     apply.click()
     page.wait_for_function("typeof window.resumeRead === 'function'")
     page.evaluate("resumeRead()")
-    page.get_by_text("已套用；不必再按外層儲存。", exact=True).wait_for()
+    page.get_by_text("已儲存並重新讀回確認。", exact=True).wait_for()
     [write] = page.evaluate("wire.filter(x => x.type.endsWith('/config_save'))")
     assert write["if_revision"] == "a" * 64 and write["if_source_snapshot"] == "b" * 64
     assert write["changes"]["tanks"][0]["scale_max_m"] == 2.75
@@ -253,7 +251,7 @@ def test_same_principal_reconnect_reports_original_snapshot_conflict(browser_pag
     page = browser_page
     page.evaluate(SETUP)
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）")
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale.fill("2.75")
     page.evaluate("""key => {
         editor.hass = {...hass, connected:false};
@@ -289,7 +287,7 @@ def test_late_previous_transport_reply_cannot_emit_success(browser_page, accepte
         editor.hass = hass;
     }""", accepted)
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）")
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale.fill("2.5")
     apply.click()
     page.wait_for_function("typeof window.settle === 'function'")
@@ -302,7 +300,7 @@ def test_late_previous_transport_reply_cannot_emit_success(browser_page, accepte
     page.evaluate("settle()")
     page.get_by_text("無法確認是否已套用；請重新讀取並核對，不要重送草稿。", exact=True).wait_for()
     assert scale.input_value() == "2.5" and apply.is_disabled()
-    assert not page.get_by_text("已套用；不必再按外層儲存。", exact=True).count()
+    assert not page.get_by_text("已儲存並重新讀回確認。", exact=True).count()
     assert page.evaluate("wire.slice(beforeReconnect).map(x=>x.type)") == [
         "config_entries/get", "uninus_water_control/config_get", "config_entries/get",
     ]
@@ -318,7 +316,7 @@ def test_editor_drops_draft_on_real_owner_loss_during_held_get(browser_page, tra
     page = browser_page
     page.evaluate(SETUP)
     scale = page.get_by_role("spinbutton", name="水位顯示量程上限（m）")
-    apply = page.get_by_role("button", name="套用整合設定", exact=True)
+    apply = page.get_by_role("button", name="儲存此桶參數", exact=True)
     scale.fill("2.75")
     page.evaluate("""() => {
         window.reconnected = {...hass, connection:{connected:true}, callWS:async (msg) => {
@@ -350,12 +348,13 @@ def test_editor_drops_draft_on_real_owner_loss_during_held_get(browser_page, tra
         page.get_by_text("只有整合管理員可以讀取及套用設定。", exact=True).wait_for()
         page.evaluate("() => { reconnected.user.is_admin = true; editor.hass = reconnected; }")
     elif transition == "close":
-        page.evaluate("() => { document.querySelector('#area').append(editor); }")
+        page.evaluate("() => { editor.hass = hass; document.querySelector('#area').append(editor); }")
     page.evaluate("releaseRead()")
     if transition == "entry":
         page.get_by_text("補水整合範圍已變更，請重新讀取設定。", exact=True).wait_for()
         assert not scale.count()
-        page.get_by_role("button", name="重新讀取（捨棄草稿）", exact=True).click()
+        assert not page.evaluate("wire.some(x => x.type.endsWith('/config_save'))")
+        return
     scale.wait_for()
     assert scale.input_value() == "4" and apply.is_disabled()
     assert not page.evaluate("wire.some(x => x.type.endsWith('/config_save'))")

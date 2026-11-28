@@ -53,13 +53,18 @@ def new_zone(registry: EntityRegistry, fields: dict) -> Zone:
 
 def level_source(registry: EntityRegistry, tank: Tank) -> str | None:
     """Resolve a binding without substituting a different registered source."""
-    if "level_sensor_registry_id" in tank:
-        source = registry.async_get(tank["level_sensor_registry_id"])
+    return binding_source(registry, tank, "level_sensor")
+
+
+def binding_source(registry: EntityRegistry, tank: Tank, field: str) -> str | None:
+    """Resolve a persisted input or passive output without inheriting an alias."""
+    if f"{field}_registry_id" in tank:
+        source = registry.async_get(tank[f"{field}_registry_id"])
         return source.entity_id if source is not None else None
     # Unregistered (including legacy name-only) bindings cannot distinguish
     # unregistered replacements. Never infer ownership of a new registry row.
-    entity_id = tank["level_sensor"]
-    return None if registry.async_is_registered(entity_id) else entity_id
+    entity_id = tank.get(field)
+    return None if entity_id and registry.async_is_registered(entity_id) else entity_id
 
 
 def legacy_inventory(entry: ConfigEntry) -> list[Zone]:

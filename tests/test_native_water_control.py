@@ -333,7 +333,9 @@ class NativeWaterControlTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmed_deletion_cleans_registry_when_controller_is_disabled(self):
         entry = await self.setup_controller()
-        await self.saved(await self.option(entry, "add_zone"), **SETUP)
+        # Duplicate labels remain valid; a newly shared source does not.
+        self.set_depth("sensor.other_zone_depth", "125", "cm")
+        await self.saved(await self.option(entry, "add_zone"), **(SETUP | {"level_sensor": "sensor.other_zone_depth"}))
         survivor, removed = entry.options["zones"]
         self.assertTrue(await self.hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER))
         self.assertEqual(entry.state, ConfigEntryState.NOT_LOADED)
@@ -401,7 +403,9 @@ class NativeWaterControlTest(unittest.IsolatedAsyncioTestCase):
         ):
             rejected = await self.submit(await self.option(entry, operation), **fields)
             self.assertEqual(rejected["reason"], reason)
-        await self.saved(await self.option(entry, "add_zone"), **SETUP)
+        # Duplicate labels remain valid; a newly shared source does not.
+        self.set_depth("sensor.other_zone_depth", "125", "cm")
+        await self.saved(await self.option(entry, "add_zone"), **(SETUP | {"level_sensor": "sensor.other_zone_depth"}))
         first, second = entry.options["zones"]
         self.assertEqual(first["name"], second["name"])
         self.assertNotEqual(first["id"], second["id"])
