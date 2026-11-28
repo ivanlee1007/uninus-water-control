@@ -39,6 +39,12 @@ def browser_page():
             }
             window.loadCardHelpers = async () => { activity.loads++; throw new Error('unexpected helper'); };
             window.id = (n) => n.toString(16).padStart(32, '0');
+            window.normalCard = () => {
+                const card = document.createElement('uninus-water-dashboard');
+                card.preview = false;
+                card.editMode = false;
+                return card;
+            };
             window.projection = (tank, zone = 1, index = tank - 1, zoneIndex = zone - 1) => ({
                 state: tank === 2 ? 'unavailable' : String(tank * 10),
                 attributes: {
@@ -72,7 +78,7 @@ def browser_page():
 def test_native_card_contract_and_container_geometry(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         if (card.setConfig) card.setConfig({type: 'custom:uninus-water-dashboard'});
         window.states = Object.fromEntries([5, 2, 4, 1, 3].map(n => [`sensor.p${n}`, projection(n)]));
         card.hass = snapshot(states);
@@ -152,7 +158,7 @@ def test_overview_summarizes_per_tank_previews_without_inventing_scale_or_output
             'binary_sensor.low': preview('binary_sensor.low', 'low_level_alarm', 'on', 1),
             'binary_sensor.unknown': preview('binary_sensor.unknown', 'low_level_alarm', 'unavailable', 2),
         };
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = {...snapshot(states, 'zh-Hant'), user: {is_admin: true}};
         document.querySelector('#area').append(card);
@@ -170,9 +176,9 @@ def test_overview_summarizes_per_tank_previews_without_inventing_scale_or_output
     assert first.get_by_role("button", name="開啟告警", exact=True).is_disabled()
     assert first.get_by_text("未設定水位量程", exact=True).is_visible()
     page.get_by_role("button", name="補水參數", exact=True).click()
-    assert page.get_by_role("link", name="前往整合設定：門檻與量程").get_attribute("href") == (
-        "/config/integrations/integration/uninus_water_control"
-    )
+    assert page.get_by_role("link").count() == 0
+    assert "編輯儀表板 → 編輯補水卡片" in page.get_by_role("region", name="補水參數").inner_text()
+    assert page.locator("input,select").count() == 0
     page.evaluate("""() => {
         states['binary_sensor.low'] = {...states['binary_sensor.low'], state: 'off'};
         card.hass = {...snapshot(states, 'en'), user: {is_admin: false}};
@@ -188,7 +194,7 @@ def test_reference_inventory_fits_three_tanks_per_zone_at_desktop_width(browser_
     page.evaluate("""() => {
         const states = Object.fromEntries(Array.from({length: 8}, (_, i) =>
             [`sensor.p${i}`, projection(i + 1, i < 4 ? 1 : 2, i % 4)]));
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
@@ -218,7 +224,7 @@ def test_calibrated_level_and_threshold_summary_follow_current_projection(browse
             }});
             card.hass = snapshot({[entity]: level});
         };
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         update('2.5');
         document.querySelector('#area').append(card);
@@ -254,7 +260,7 @@ def test_mixed_thresholds_stay_on_their_own_validated_tanks(browser_page):
             level.attributes.uninus_water_display = {version: 1, refill: [i, i + 1], alarm: [i, 5]};
             states[entity] = level;
         }
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
@@ -276,7 +282,7 @@ def test_mixed_thresholds_stay_on_their_own_validated_tanks(browser_page):
 def test_tank_readout_uses_a_vessel_without_claiming_a_measured_scale(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = snapshot({'sensor.p1': projection(1)});
         document.querySelector('#area').append(card);
@@ -293,7 +299,7 @@ def test_tank_readout_uses_a_vessel_without_claiming_a_measured_scale(browser_pa
 def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         window.preview = (entity, kind, state, zone = 1, tank = 1, extra = {}) => ({
             entity_id: entity, state, attributes: {uninus_water_thresholds: {
@@ -368,7 +374,7 @@ def test_threshold_previews_are_tank_scoped_read_only_and_fail_closed(browser_pa
 def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         window.states = {'sensor.p1': projection(1), 'sensor.p2': projection(2),
             'sensor.p3': projection(3, 2, 0)};
         document.querySelector('#area').append(card);
@@ -431,7 +437,7 @@ def test_live_inventory_keeps_native_nodes_and_keyboard_focus(browser_page):
 def test_disconnected_card_reads_latest_snapshot_without_ha_helpers(browser_page):
     page = browser_page
     page.evaluate("""() => {
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         document.querySelector('#area').append(card);
     }""")
@@ -461,7 +467,7 @@ def test_duplicate_labels_keep_distinct_tiles_through_resize_and_availability(br
         for (const state of Object.values(states)) {
             state.attributes.uninus_water_dashboard.tank.name = 'Same tank';
         }
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
@@ -522,7 +528,7 @@ def test_malformed_or_conflicting_projections_cannot_create_tiles(browser_page):
         add('sensor.duplicate_zone_slot_first', 13, 6, 0, 9);
         add('sensor.duplicate_zone_slot_second', 14, 7, 0, 9);
         states['sensor.friendly_only'] = {state: '25', attributes: {friendly_name: 'Water zone Tank 1'}};
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
@@ -560,7 +566,7 @@ def test_manual_controls_confirm_start_keep_stop_and_refuse_stale_bindings(brows
         window.push = (language = 'en') => {
             card.hass = {...snapshot({...states}, language), connected: true, callService: service};
         };
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         push();
         document.querySelector('#area').append(card);
@@ -680,7 +686,7 @@ def test_approved_console_has_chinese_tabs_and_two_truthful_action_slots(browser
         tank.name = '東 1 桶';
         state.attributes.unit_of_measurement = 'm';
         state.attributes.uninus_water_display = {version: 1, scale_max_m: 2.5, refill: [0.5, 1.5]};
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = {...snapshot({[entity_id]: state}, 'en-US'), user: {is_admin: true}};
         document.querySelector('#area').append(card);
@@ -713,7 +719,7 @@ def test_approved_console_has_chinese_tabs_and_two_truthful_action_slots(browser
     assert page.get_by_role("region", name="補水參數", exact=True).get_by_text("水位量程：0–2.5 m", exact=True).is_visible()
     assert not tank.is_visible()
     devices.click()
-    assert page.get_by_role("heading", name="管理區域與水桶", exact=True).is_visible()
+    assert page.get_by_role("heading", name="區域與水桶清單", exact=True).is_visible()
     assert not page.get_by_role("heading", name="各桶門檻與顯示量程", exact=True).is_visible()
     assert page.get_by_text("東 1 桶", exact=True).last.is_visible()
     total.click()
@@ -733,7 +739,7 @@ def test_rejected_start_with_unchanged_feedback_leaves_a_guarded_stop_available(
             'button.refill_start': wire('button.refill_start', 'unknown', 'start'),
             'button.refill_stop': wire('button.refill_stop', 'unknown', 'stop')};
         window.calls = [];
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = {...snapshot(states), connected: true, callService: (...args) => {
             calls.push(args);
@@ -796,7 +802,7 @@ def remap_page(browser_page):
             else replies[index].resolve();
             await new Promise(requestAnimationFrame);
         };
-        window.card = document.createElement('uninus-water-dashboard');
+        window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         push();
         document.querySelector('#area').append(card);

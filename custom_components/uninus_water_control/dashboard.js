@@ -1,4 +1,5 @@
 const TAG = "uninus-water-dashboard";
+const DOMAIN = "uninus_water_control";
 const ATTRIBUTE = "uninus_water_dashboard";
 const MANUAL = "uninus_water_manual";
 const PREVIEW = "uninus_water_thresholds";
@@ -86,6 +87,11 @@ const STYLE = `
   .pill.wait { background:var(--wait-bg); color:var(--wait); }
   .notice { background:var(--card); border:1px solid var(--line); border-radius:9px; padding:8px 10px; }
   .zones,.editor-split { display:grid; gap:10px; align-items:start; }
+  .alarm-history { margin-top:12px; }
+  .alarm-history-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .alarm-history select { max-width:100%; color:var(--primary-text-color); background:var(--card-background-color); }
+  .alarm-history ol { padding-inline-start:1.5em; }
+  .alarm-history li { margin-block:4px; overflow-wrap:anywhere; }
   .zones { grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); }
   .zone-head { margin-bottom:8px; }
   .tanks { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,138px),1fr)); gap:7px; }
@@ -373,9 +379,41 @@ const stopObservation = (binding) => binding?.status && binding.buttons.stop
 const settledOff = (status) => status && (status.phase === "idle" || status.phase === "fault") &&
   status.requested === "off" && status.actual === "off" && !status.pending_on && !status.pending_off;
 
+const ALARM_HISTORY_COMMAND = "uninus_water_control/alarm_history_get";
+const HISTORY_STATUS = {
+  no_binding: "未設定告警輸出",
+  unavailable: "沒有可驗證的告警輸出歷史",
+  no_events: "已驗證的涵蓋期間內沒有開關變化",
+  ok: "已驗證的告警輸出變化",
+};
+
+function validHistoryDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(value)) return false;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 23) === value.slice(0, 23);
+}
+
+function validHistory(result) {
+  if (result?.version !== 1 || typeof result.scope !== "string" || !/^[0-9a-f]{32}$/.test(result.scope) ||
+      typeof result.status !== "string" || !Object.hasOwn(HISTORY_STATUS, result.status) || typeof result.limited !== "boolean" ||
+      !Array.isArray(result.events) || result.events.length > 50) return false;
+  const interval = (item) => validHistoryDate(item?.start_utc) && validHistoryDate(item?.end_utc) &&
+    item.start_utc <= item.end_utc;
+  const { window, coverage, events, status, limited } = result;
+  if (!interval(window) || Date.parse(window.end_utc) - Date.parse(window.start_utc) !== 86400000) return false;
+  if (status === "no_binding" || status === "unavailable") return coverage === null && !events.length && !limited;
+  if (!interval(coverage) || coverage.start_utc < window.start_utc || coverage.end_utc > window.end_utc ||
+      (status === "ok") !== (events.length > 0)) return false;
+  return events.every((row, index) => validHistoryDate(row?.at_utc) && ["on", "off"].includes(row.state) &&
+    row.at_utc > coverage.start_utc && row.at_utc <= coverage.end_utc &&
+    (!index || events[index - 1].at_utc > row.at_utc));
+}
+
 class UninusWaterDashboard extends HTMLElement {
   #hass;
   #configured = false;
+  #preview;
+  #editMode;
 
   #layout;
   #notice;
@@ -391,6 +429,11 @@ class UninusWaterDashboard extends HTMLElement {
   #sessionEpoch = 0;
   #confirmation;
   #dialog;
+  #history;
+  #historyContext;
+  #historyEpoch = 0;
+  #historyFlight;
+  #historyDenied;
 
   constructor() {
     super();
@@ -433,34 +476,39 @@ class UninusWaterDashboard extends HTMLElement {
     this.#views.get("overview").section.append(summary, this.#notice, this.#layout);
     this.#overview = { count, summary, refill, alarm };
     for (const [key, titleText, linkText, help] of [
-      ["parameters", "各桶門檻與顯示量程", "前往整合設定：門檻與量程",
-        "此處僅顯示各桶已儲存的參數，不會自動補水或操作告警。若要修改，在整合的「設定」選單選擇門檻預覽或水位顯示量程。"],
-      ["devices", "管理區域與水桶", "前往整合設定：區域與水桶",
+      ["parameters", "各桶門檻與顯示量程", null,
+        "此處僅顯示已套用的參數。管理員可在「編輯儀表板 → 編輯補水卡片」調整；門檻預覽不操作設備。"],
+      ["devices", "區域與水桶清單", "前往整合設定：區域與水桶",
         "此處列出可讀取的水桶與手動控制。若要新增、改名或變更綁定，在整合的「設定」選單選擇對應的區域或水桶操作。"],
     ]) {
       const view = this.#views.get(key);
       const frame = element("div", "formbox");
       const header = element("header", "flex");
       const title = element("h2");
-      const link = element("a", "options-link");
       const description = element("p", "dim");
       const inventory = element("div", "editor-split");
       text(title, titleText);
-      text(link, linkText);
       text(description, help);
-      link.href = OPTIONS_PATH;
-      link.hidden = true;
-      header.append(title, link);
+      header.append(title);
+      const link = linkText ? element("a", "options-link") : null;
+      if (link) {
+        text(link, linkText);
+        link.href = OPTIONS_PATH;
+        link.hidden = true;
+        header.append(link);
+      }
       frame.append(header, description, inventory);
       view.section.append(frame);
       Object.assign(view, { inventory, link, rows: new Map() });
     }
+    this.#mountHistory(this.#views.get("parameters").section);
     this.#showView("overview");
     root.append(style, this.#shell);
   }
 
   #showView(key) {
     if (this.#view !== key) this.#closeConfirmation();
+    if (this.#view === "parameters" && key !== this.#view) this.#clearHistory(true);
     this.#view = key;
     for (const [id, { section, tab }] of this.#views) {
       const active = id === key;
@@ -471,6 +519,40 @@ class UninusWaterDashboard extends HTMLElement {
 
   static getStubConfig() {
     return { type: `custom:${TAG}` };
+  }
+
+  static getConfigElement() {
+    return document.createElement(EDITOR_TAG);
+  }
+
+  set preview(value) {
+    if (this.#preview === value) return;
+    this.#preview = value;
+    this.#hostModeChanged();
+  }
+
+  get preview() { return this.#preview; }
+
+  set editMode(value) {
+    if (this.#editMode === value) return;
+    this.#editMode = value;
+    this.#hostModeChanged();
+  }
+
+  get editMode() { return this.#editMode; }
+
+  #operationView() {
+    // hui-card supplies both flags, after hass on initial load and in sequence
+    // on updates. Unknown/partially supplied flags never authorize equipment.
+    return this.#preview === false && this.#editMode === false;
+  }
+
+  #hostModeChanged() {
+    if (!this.#operationView()) {
+      this.#closeConfirmation();
+      this.#clearPanelFeedback();
+    }
+    this.#render();
   }
 
   getGridOptions() {
@@ -507,6 +589,161 @@ class UninusWaterDashboard extends HTMLElement {
   disconnectedCallback() {
     this.#closeConfirmation();
     this.#clearPanelFeedback();
+    this.#clearHistory(true);
+  }
+
+  #mountHistory(parent) {
+    const host = element("section", "formbox alarm-history");
+    host.setAttribute("aria-label", "告警輸出紀錄");
+    const title = element("h2");
+    text(title, "告警輸出紀錄");
+    const controls = element("div", "alarm-history-controls");
+    const label = element("label");
+    text(label, "選擇水桶 ");
+    const select = element("select");
+    select.setAttribute("aria-label", "選擇水桶");
+    label.append(select);
+    const refresh = button("settings-action");
+    text(refresh, "重新整理紀錄");
+    controls.append(label, refresh);
+    const range = element("p", "dim");
+    const summary = element("p");
+    summary.setAttribute("aria-live", "polite");
+    const coverage = element("p", "dim");
+    const list = element("ol");
+    host.append(title, controls, range, summary, coverage, list);
+    host.hidden = true;
+    this.#history = { parent, host, select, refresh, range, summary, coverage, list, targets: new Map() };
+    select.addEventListener("change", () => {
+      const pane = this.#history;
+      if (pane.host.hidden || !pane.targets.has(select.value) || pane.key === select.value) return;
+      this.#clearHistory();
+      pane.key = select.value;
+      this.#paintHistory();
+    });
+    refresh.addEventListener("click", () => void this.#refreshHistory());
+  }
+
+  #clearHistory(reset = false) {
+    this.#historyEpoch++;
+    const pane = this.#history;
+    pane.result = pane.message = undefined;
+    if (reset) {
+      pane.host.hidden = true;
+      pane.host.remove();
+      pane.key = undefined;
+      pane.targets.clear();
+      pane.select.replaceChildren();
+    }
+    this.#paintHistory();
+  }
+
+  #currentHistoryContext() {
+    const hass = this.#hass;
+    return [hass?.user?.id, hass?.user?.is_admin, hass?.user?.is_active,
+      hass?.connection, hass?.connected, hass?.callWS];
+  }
+
+  #canReadHistory() {
+    const hass = this.#hass;
+    return this.isConnected && this.#view === "parameters" && this.#operationView() &&
+      !!hass?.user?.id && hass.user.is_admin === true && hass.user.is_active !== false &&
+      !!hass.connection && hass.connected !== false && typeof hass.callWS === "function";
+  }
+
+  #updateHistory(zones, states) {
+    const context = this.#currentHistoryContext();
+    const pane = this.#history;
+    if (!this.#historyContext || context.some((value, index) => this.#historyContext[index] !== value)) {
+      this.#historyContext = context;
+      this.#historyDenied = undefined;
+      this.#clearHistory(true);
+    }
+    if (!this.#canReadHistory()) {
+      if (!pane.host.hidden) this.#clearHistory(true);
+      return;
+    }
+    const targets = new Map();
+    for (const zone of zones) for (const tank of zone.tanks) {
+      const entry_id = states[tank.entity]?.attributes?.uninus_water_settings_entry;
+      if (typeof entry_id !== "string" || !ENTRY_ID.test(entry_id)) continue;
+      const key = `${entry_id}:${zone.id}:${tank.id}:${tank.entity}`;
+      targets.set(key, { label: `${zone.name} · ${tank.name}`, request: { entry_id, zone_id: zone.id, tank_id: tank.id } });
+    }
+    const sameOptions = targets.size === pane.targets.size && [...targets].every(([key, row], index) =>
+      pane.select.options[index]?.value === key && pane.targets.get(key)?.label === row.label);
+    pane.targets = targets;
+    if (!targets.has(pane.key)) {
+      if (pane.key !== undefined) this.#clearHistory();
+      pane.key = targets.keys().next().value;
+    }
+    if (!sameOptions) pane.select.replaceChildren(...[...targets].map(([key, row]) => {
+      const option = element("option");
+      option.value = key;
+      text(option, row.label);
+      return option;
+    }));
+    if (pane.key && pane.select.value !== pane.key) pane.select.value = pane.key;
+    pane.host.hidden = false;
+    if (!pane.host.parentNode) pane.parent.append(pane.host);
+    this.#paintHistory();
+  }
+
+  #paintHistory() {
+    const pane = this.#history;
+    const { result, key } = pane;
+    const denied = key && this.#historyDenied === key;
+    pane.select.disabled = !key;
+    pane.refresh.disabled = pane.host.hidden || !key || !!this.#historyFlight || !!denied;
+    const utc = (value, precise = false) => `${value.replace("T", " ").slice(0, precise ? -1 : 19)} UTC`;
+    text(pane.range, result ? `查詢：${utc(result.window.start_utc)} 至 ${utc(result.window.end_utc)}。僅表示輸出變化，不代表觸發原因。` :
+      "查詢最近 24 小時，最多 50 筆。僅含已確認的告警輸出變化，不代表觸發原因。");
+    text(pane.summary, result ? HISTORY_STATUS[result.status] : pane.message || (denied ? "沒有權限讀取所選紀錄。" :
+      key ? "選擇水桶並重新整理。" : "沒有可查詢的水桶。"));
+    text(pane.coverage, result?.coverage ?
+      `已驗證涵蓋：${utc(result.coverage.start_utc, true)} 至 ${utc(result.coverage.end_utc, true)}${result.limited ? " · 僅顯示有限的最新紀錄" : ""}` : "");
+    if (pane.rendered === result) return;
+    pane.rendered = result;
+    pane.list.replaceChildren(...(result?.events ?? []).map((row) => {
+      const li = element("li");
+      const time = element("time");
+      time.dateTime = row.at_utc;
+      text(time, utc(row.at_utc, true));
+      li.append(time, row.state === "on" ? " · 開啟" : " · 關閉");
+      return li;
+    }));
+  }
+
+  async #refreshHistory() {
+    const pane = this.#history;
+    const key = pane.key;
+    const target = pane.targets.get(key);
+    if (this.#historyFlight || !this.#canReadHistory() || !target || this.#historyDenied === key) return;
+    const flight = { epoch: this.#historyEpoch, context: this.#currentHistoryContext() };
+    this.#historyFlight = flight;
+    pane.result = undefined;
+    pane.message = "正在查詢紀錄…";
+    this.#paintHistory();
+    const current = () => this.#historyFlight === flight && this.#historyEpoch === flight.epoch &&
+      this.#canReadHistory() && pane.key === key &&
+      this.#currentHistoryContext().every((value, index) => value === flight.context[index]);
+    try {
+      const result = await this.#hass.callWS({ type: ALARM_HISTORY_COMMAND, version: 1, ...target.request });
+      if (current()) {
+        if (validHistory(result)) pane.result = result;
+        else pane.message = "無法確認紀錄格式。";
+      }
+    } catch (err) {
+      if (current()) {
+        if (err?.code === "unauthorized") this.#historyDenied = key;
+        pane.message = err?.code === "unauthorized" ? "沒有權限讀取所選紀錄。" : "無法查詢紀錄，請重新整理。";
+      }
+    } finally {
+      if (this.#historyFlight === flight) {
+        this.#historyFlight = undefined;
+        this.#paintHistory();
+      }
+    }
   }
 
   #clearPanelFeedback() {
@@ -622,7 +859,7 @@ class UninusWaterDashboard extends HTMLElement {
 
   #allowed(panel, binding, action) {
     const { buttons, status } = binding;
-    if (typeof this.#hass.callService !== "function" || this.#hass.connected === false ||
+    if (!this.#operationView() || typeof this.#hass.callService !== "function" || this.#hass.connected === false ||
         this.#hass.user?.is_active === false ||
         !buttons[action] || this.#busy(panel, action, buttons[action])) return false;
     // Stop is never gated on the status of ON or on a Start transport flight.
@@ -639,6 +876,7 @@ class UninusWaterDashboard extends HTMLElement {
   }
 
   #observeStart(panel, binding) {
+    if (!this.#operationView()) return;
     const slot = manualSlot(panel);
     const interlock = this.#startInterlocks.get(slot);
     if (!interlock) return;
@@ -760,7 +998,8 @@ class UninusWaterDashboard extends HTMLElement {
     stop.hidden = !stopping;
     reset.hidden = !status?.fault;
     const actionAllowed = (action) => !!binding && this.#allowed(panel, binding, action);
-    const reason = !binding ? "未提供受控按鈕（尚未啟用或無法讀取）" : !status ? "無法取得控制狀態" : "目前不可操作";
+    const reason = !this.#operationView() ? "編輯預覽不能操作設備" :
+      !binding ? "未提供受控按鈕（尚未啟用或無法讀取）" : !status ? "無法取得控制狀態" : "目前不可操作";
     for (const action of ACTIONS) {
       const control = panel.buttons[action];
       const disabled = !actionAllowed(action);
@@ -847,6 +1086,7 @@ class UninusWaterDashboard extends HTMLElement {
     this.#notice.hidden = zones.length > 0;
     text(this.#notice, states ? "沒有可顯示的水桶。" : "正在載入總覽卡片…");
     this.#updateCards(zones, states ?? {});
+    this.#updateHistory(zones, states ?? {});
   }
 
   #updateCards(zones, states) {
@@ -1007,6 +1247,1006 @@ class UninusWaterDashboard extends HTMLElement {
 
 }
 
+const EDITOR_TAG = `${TAG}-editor`;
+const ENTRY_ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+const SETTINGS_ID = /^[0-9a-f]{32}$/;
+const REVISION = /^[0-9a-f]{64}$/;
+const POLICY = {
+  refill: { label: "補水門檻", fields: ["下限（m）", "上限（m）"], describe: refillText },
+  alarm: { label: "低液位告警", fields: ["低位門檻（m）", "延遲（秒）"], describe: alarmText },
+};
+const policyKinds = Object.keys(POLICY);
+const samePair = (a, b) => a === b || (a !== null && b !== null && a[0] === b[0] && a[1] === b[1]);
+const matchesId = (value, pattern) => typeof value === "string" && pattern.test(value) && value.trim() === value;
+const validScale = (value) => value === null || (Number.isFinite(value) && value > 0);
+const settingsPairText = (kind, pair) => !pair ? "未設定" : kind === "refill" ?
+  `${pair[0]}／${pair[1]} m` : `≤ ${pair[0]} m · ${pair[1]} 秒`;
+const APPLIED = "已套用；不必再按外層儲存。";
+
+const MAX_ALARM_DELAY = 2147483647;
+
+function validPair(kind, value, allowLegacy = false) {
+  return value === null || (Array.isArray(value) && value.length === 2 && value.every(Number.isFinite) &&
+    (kind === "refill" ? value[0] < value[1] : Number.isInteger(value[1]) && value[1] >= 1 &&
+      (allowLegacy || value[1] <= MAX_ALARM_DELAY)));
+}
+
+// Core and the browser may round an unsafe integer before they can validate it.
+const writableNumber = (value) => Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER;
+const writablePair = (kind, value) => validPair(kind, value) && (value === null || value.every(writableNumber));
+
+function settingsError(code) { return Object.assign(new Error(code), { code }); }
+
+function readSettingsDto(value, entry) {
+  const bad = () => { throw settingsError("invalid_readback"); };
+  if (value?.version !== 1 || value.entry_id !== entry || !matchesId(value.revision, REVISION) ||
+      !matchesId(value.source_snapshot, REVISION) || !Array.isArray(value.zones)) bad();
+  const common = {};
+  for (const kind of policyKinds) {
+    const pair = value.common?.[kind];
+    if (!validPair(kind, pair)) bad();
+    common[kind] = pair;
+  }
+  const zonesSeen = new Set();
+  const tanksSeen = new Set();
+  const label = (name) => typeof name === "string" && name.trim();
+  const zones = value.zones.map((zone) => {
+    if (!matchesId(zone?.id, SETTINGS_ID) || zonesSeen.has(zone.id) || !label(zone.name) || !Array.isArray(zone.tanks)) bad();
+    zonesSeen.add(zone.id);
+    const tanks = zone.tanks.map((tank) => {
+      if (!matchesId(tank?.id, SETTINGS_ID) || tanksSeen.has(tank.id) || !label(tank.name) || !validScale(tank.scale_max_m)) bad();
+      tanksSeen.add(tank.id);
+      const result = { id: tank.id, name: tank.name, scale_max_m: tank.scale_max_m };
+      for (const kind of policyKinds) {
+        const policy = tank[kind];
+        if (typeof policy?.use_common !== "boolean" || !validPair(kind, policy.local, true) ||
+            !validPair(kind, policy.effective, !policy.use_common) ||
+            (policy.use_common && common[kind] === null) ||
+            !samePair(policy.effective, policy.use_common ? common[kind] : policy.local)) bad();
+        result[kind] = { use_common: policy.use_common, local: policy.local, effective: policy.effective };
+      }
+      return result;
+    });
+    return { id: zone.id, name: zone.name, tanks };
+  });
+  return { version: 1, entry_id: entry, revision: value.revision, source_snapshot: value.source_snapshot, common, zones };
+}
+
+const TOPOLOGY_ROLES = { level_sensor: "液位感測器", refill_switch: "補水開關（選填）", alarm_switch: "告警開關（選填）" };
+const UNAVAILABLE_BINDING = "現有綁定無法使用";
+const exactFields = (value, fields) => value && typeof value === "object" && !Array.isArray(value) &&
+  Object.keys(value).length === fields.length && fields.every((field) => Object.hasOwn(value, field));
+const topologyName = (name) => typeof name === "string" && name.trim().length > 0;
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const topologyShape = (zones) => zones.map(({ id, name, tanks }) => ({ id, name, tanks: tanks.map(
+  ({ id, name, level_sensor, refill_switch, alarm_switch }) => ({ id, name, level_sensor, refill_switch, alarm_switch })) }));
+
+function readTopologyDto(value, entry) {
+  const bad = () => { throw settingsError("invalid_format"); };
+  const binding = (row, domain, existing) => {
+    if (!exactFields(row, ["entity_id", "registry_id"])) bad();
+    const registered = matchesId(row.registry_id, SETTINGS_ID);
+    if (existing && row.entity_id === null && registered) return { entity_id: null, registry_id: row.registry_id };
+    if (typeof row.entity_id !== "string" || !/^(?:sensor|switch)\.[a-z0-9_]+$/.test(row.entity_id) ||
+        (domain && !row.entity_id.startsWith(`${domain}.`)) || !(registered || existing && row.registry_id === null)) bad();
+    return { entity_id: row.entity_id, registry_id: row.registry_id };
+  };
+  if (!exactFields(value, ["version", "entry_id", "revision", "source_snapshot", "zones", "candidates"]) ||
+      value.version !== 1 || value.entry_id !== entry || !/^[0-9a-f]{64}$/.test(value.revision) ||
+      !/^[0-9a-f]{64}$/.test(value.source_snapshot) || !Array.isArray(value.zones) || !value.zones.length ||
+      !Array.isArray(value.candidates)) bad();
+  const zIds = new Set(), tIds = new Set(), names = new Set();
+  const zones = value.zones.map((z) => {
+    if (!exactFields(z, ["id", "name", "tanks"]) || !matchesId(z.id, SETTINGS_ID) || zIds.has(z.id) ||
+        !topologyName(z.name) || !Array.isArray(z.tanks) || !z.tanks.length) bad();
+    zIds.add(z.id);
+    const tanks = z.tanks.map((t) => {
+      if (!exactFields(t, ["id", "name", "protected", ...Object.keys(TOPOLOGY_ROLES)]) || !matchesId(t.id, SETTINGS_ID) ||
+          tIds.has(t.id) || !topologyName(t.name) || typeof t.protected !== "boolean") bad();
+      tIds.add(t.id);
+      return { id: t.id, name: t.name, protected: t.protected, level_sensor: binding(t.level_sensor, "sensor", true),
+        refill_switch: t.refill_switch === null ? null : binding(t.refill_switch, "switch", true),
+        alarm_switch: t.alarm_switch === null ? null : binding(t.alarm_switch, "switch", true) };
+    });
+    return { id: z.id, name: z.name, tanks };
+  });
+  const candidates = value.candidates.map((raw) => {
+    const row = binding(raw, null, false);
+    if (names.has(row.entity_id)) bad();
+    names.add(row.entity_id);
+    return row;
+  });
+  return { version: 1, entry_id: entry, revision: value.revision, source_snapshot: value.source_snapshot, zones, candidates };
+}
+
+function verifyTopologySave(draft, saved, settings, readback, baseline) {
+  if (saved.revision === baseline.revision || saved.revision !== settings.revision ||
+      saved.source_snapshot !== settings.source_snapshot || !sameJson(saved.zones, readback.zones) ||
+      saved.revision !== readback.revision || saved.source_snapshot !== readback.source_snapshot ||
+      !sameJson(saved.zones.map(z => z.tanks.map(t => t.id)), settings.zones.map(z => z.tanks.map(t => t.id))) ||
+      saved.zones.length !== draft.topology.zones.length) throw settingsError("readback_required");
+  const expected = draft.expected;
+  const previous = new Map(expected.zones.flatMap((z) => z.tanks.map((t) => [t.id, t])));
+  const original = new Map(baseline.zones.flatMap(z => z.tanks.map(t => [t.id, t.protected])));
+  const sameId = (prior, actual, ids) => prior === null ? !ids.has(actual) : prior === actual;
+  const priorZones = new Set(baseline.zones.map(z => z.id));
+  expected.zones = topologyShape(saved.zones).map((zone, zi) => {
+    const wanted = draft.topology.zones[zi];
+    if (!sameId(wanted.id, zone.id, priorZones) || zone.name !== wanted.name || zone.tanks.length !== wanted.tanks.length) {
+      throw settingsError("readback_required");
+    }
+    return { id: zone.id, name: zone.name, tanks: zone.tanks.map((tank, ti) => {
+      const requested = wanted.tanks[ti];
+      const protectedTank = saved.zones[zi].tanks[ti].protected;
+      if (!sameId(requested.id, tank.id, original) || !sameJson({ ...requested, id: tank.id }, tank) ||
+          protectedTank !== (original.get(tank.id) ?? false)) throw settingsError("readback_required");
+      const empty = { use_common: false, local: null, effective: null };
+      const prior = previous.get(tank.id) ?? { id: tank.id, scale_max_m: null, refill: empty, alarm: empty };
+      return { id: tank.id, name: tank.name, scale_max_m: prior.scale_max_m, refill: prior.refill, alarm: prior.alarm };
+    }) };
+  });
+  expected.revision = saved.revision;
+  expected.source_snapshot = saved.source_snapshot;
+  if (!sameJson(expected, settings)) throw settingsError("readback_required");
+}
+
+function settingsConflict(before, current) {
+  if (before.revision !== current.revision) return "stale_revision";
+  if (before.source_snapshot !== current.source_snapshot) return "stale_source";
+}
+
+const topologyLabels = (zones) => zones.map(({ id, name, tanks }) => [id, name, tanks.map(t => [t.id, t.name])]);
+
+const EDITOR_CSS = `
+  :host { display:block; min-width:0; width:100%; }
+  .settings { container:water-settings / inline-size; color:var(--primary-text-color,#143047); font-size:14px; line-height:1.45; }
+  *, *::after, *::before { box-sizing:border-box; }
+  h2,h3,h4,p { margin:0; overflow-wrap:anywhere; }
+  h2 { font-size:1.15rem; }
+  h3 { font-size:1rem; }
+  h4 { font-size:.95rem; }
+  .section,.tank-settings,.shared,.apply-strip { min-width:0; border-radius:12px; padding:12px; display:grid; gap:10px; }
+  .section { background:var(--secondary-background-color,#eef4f9); }
+  .shared,.tank-settings,.apply-strip { background:var(--card-background-color,#fff); border:1px solid var(--divider-color,#cddce7); }
+  .apply-strip { position:sticky; top:0; z-index:1; }
+  .affected { margin:0; padding-inline-start:1.25em; max-height:6em; overflow:auto; overflow-wrap:anywhere; }
+  .editor-content,.zone-settings { display:grid; gap:10px; min-width:0; }
+  ha-entity-picker { display:block; min-width:0; width:100%; }
+  .shared-grid,.policy-grid,.pair { display:grid; gap:8px; min-width:0; grid-template-columns:minmax(0,1fr); }
+  @container water-settings (min-width:420px) {
+    .shared-grid,.policy-grid,.pair { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  }
+  fieldset { min-inline-size:0; margin:0; padding:8px; border:1px solid var(--divider-color,#cddce7); border-radius:8px; }
+  fieldset > :not(legend) + * { margin-top:7px; }
+  legend { max-inline-size:100%; overflow-wrap:anywhere; padding-inline:4px; font-weight:600; }
+  label { display:grid; gap:4px; min-width:0; }
+  input,select,button { font:inherit; color:inherit; }
+  input,select { width:100%; min-width:0; border:1px solid var(--divider-color,#aabcc9); border-radius:6px;
+    background:var(--primary-background-color,#fff); padding:8px; }
+  .dim { color:var(--secondary-text-color,#4f6477); }
+  .actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+  button { cursor:pointer; padding:8px 12px; color:var(--primary-text-color,#143047);
+    background:var(--secondary-background-color,#eef4f9); border:1px solid var(--divider-color,#aabcc9); border-radius:8px; }
+  .apply { background:var(--primary-color,#075f92); color:var(--text-primary-color,#fff); border-color:transparent; font-weight:650; }
+  button:disabled { cursor:not-allowed; background:var(--secondary-background-color,#eef4f9); color:var(--disabled-text-color,#4f6477); }
+  :focus-visible { outline:2px solid var(--primary-color,#075f92); outline-offset:2px; }
+  a { color:var(--link-text-color,#075f92); overflow-wrap:anywhere; }
+  [hidden] { display:none !important; }
+`;
+
+function labeledControl(labelText, node) {
+  const label = element("label");
+  const caption = element("span");
+  text(caption, labelText);
+  label.append(caption, node);
+  return label;
+}
+
+function settingsNumber(value, options = {}) {
+  const input = element("input");
+  input.type = "number";
+  input.step = options.integer ? "1" : "any";
+  if (options.integer) {
+    input.min = "1";
+    input.max = String(MAX_ALARM_DELAY);
+  }
+  input.value = value ?? "";
+  return input;
+}
+
+function readNumber(input) {
+  return input.validity.badInput ? NaN : input.value === "" ? null : input.valueAsNumber;
+}
+
+function pairFields(kind, baseline, mode) {
+  const { label, fields, describe } = POLICY[kind];
+  const frame = element("fieldset");
+  const legend = element("legend");
+  text(legend, mode ? label : `共用${label}`);
+  frame.append(legend);
+  const saved = element("p", "dim");
+  text(saved, `目前套用：${baseline ? describe(baseline) : "未設定"}`);
+  frame.append(saved);
+  let select;
+  if (mode) {
+    select = element("select");
+    for (const [value, caption] of [["local", "個別設定"], ["common", "使用共用設定"]]) {
+      const option = element("option");
+      option.value = value;
+      text(option, caption);
+      select.append(option);
+    }
+    select.value = mode.use_common ? "common" : "local";
+    frame.append(labeledControl(`${label}模式`, select));
+  }
+  const values = mode ? mode.local : baseline;
+  const pair = element("div", "pair");
+  const inputs = fields.map((name, index) => {
+    const input = settingsNumber(values?.[index], { integer: kind === "alarm" && index === 1 });
+    pair.append(labeledControl(name, input));
+    return input;
+  });
+  frame.append(pair);
+  const draft = element("p", "dim");
+  frame.append(draft);
+  const legacyText = !writablePair(kind, values) ? inputs.map((input) => input.value) : null;
+  return { frame, select, pair, inputs, draft, legacyText };
+}
+
+function draftPair(kind, { inputs, legacyText }, baseline) {
+  // An unchanged binary64 value from an existing source is not a new write.
+  if (legacyText?.every((value, index) => value === inputs[index].value && !inputs[index].validity.badInput)) {
+    return { pair: baseline, valid: true };
+  }
+  const values = inputs.map(readNumber);
+  const pair = values.every((value) => value === null) ? null : values;
+  return { pair, valid: writablePair(kind, pair) };
+}
+
+const SETTINGS_MESSAGES = {
+  ambiguous_entry: "找到多筆補水整合，無法安全選定設定範圍。",
+  entry_not_loaded: "找不到唯一且已載入的補水整合。",
+  scope_changed: "補水整合範圍已變更，請重新讀取設定。",
+  unauthorized: "只有整合管理員可以讀取及套用設定。",
+  stale_revision: "設定已被變更；請重新讀取並核對後再修改。本次草稿未套用。",
+  stale_source: "水桶來源已變更；請重新讀取並核對後再修改。本次草稿未套用。",
+  readback_required: "無法確認是否已套用；請重新讀取並核對，不要重送草稿。",
+  invalid_readback: "無法驗證整合回傳的設定；請重新讀取並核對。",
+  settings_unavailable: "無法安全讀取整合設定；請由管理員檢查整合或備份。",
+  topology_not_enrolled: "此整合尚未移轉區桶設定。請先完成原生整合設定的安全移轉。",
+  topology_restart_required: "區桶移轉尚未完成。請依原生整合設定的指示保留獨立切斷並重新啟動。",
+  topology_recovery_required: "區桶設定需要復原。輸出身分與實際狀態未確認；請依整合復原指引處理。",
+  topology_picker_unavailable: "此 Home Assistant 編輯環境無法載入原生實體選擇器。",
+  binding_conflict: "選取的感測器或開關與其他綁定衝突。本次草稿未套用。",
+  protected_topology: "不能換綁或移除已啟用控制的水桶。請前往原生整合安全設定。",
+  removal_confirmation_required: "移除範圍未獲確認。本次草稿未套用。",
+};
+
+function editorPrincipal(hass) {
+  return [hass?.user?.id, hass?.user?.is_admin, hass?.user?.is_active];
+}
+
+function editorTransport(hass) {
+  return [hass?.connection, hass?.connection?.connected, hass?.connected, hass?.callWS];
+}
+
+const sameContext = (a, b) => a.every((part, index) => part === b[index]);
+
+function authorizedEditor([id, admin, active]) {
+  // Native current_user need not expose is_active; Core rechecks the principal.
+  return typeof id === "string" && !!id && admin === true && active !== false;
+}
+
+function readyTransport([connection, socketReady, connected, callWS]) {
+  return !!connection && socketReady !== false && connected === true && typeof callWS === "function";
+}
+
+class UninusWaterDashboardEditor extends HTMLElement {
+  #hass;
+  #principal = [];
+  #transport = [];
+  #configured = false;
+  #epoch = 0;
+  #flight;
+  #needsRead = true;
+  #problem;
+  #snapshot;
+  #fields;
+  #content;
+  #status;
+  #impact;
+  #impactList;
+  #reload;
+  #review;
+  #conflict;
+  #currentValues;
+  #apply;
+  #openInventory;
+  #topology;
+
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: "open" });
+    const css = element("style");
+    css.textContent = EDITOR_CSS;
+    const shell = element("div", "settings editor-content");
+    shell.lang = "zh-Hant";
+    this.#content = element("div", "editor-content");
+    const onDraft = () => {
+      if (this.#status.textContent === APPLIED) text(this.#status, "");
+      this.#updateDraft();
+    };
+    this.#content.addEventListener("input", onDraft);
+    this.#content.addEventListener("change", onDraft);
+    const footer = element("div", "apply-strip");
+    const info = element("p");
+    text(info, "套用會影響使用同一整合的所有卡片，不會操作設備。外層儲存只處理卡片；取消可丟棄尚未套用的草稿，但不能撤銷已套用的整合設定。");
+    this.#impact = element("p", "dim");
+    this.#impactList = element("ul", "affected dim");
+    this.#impactList.setAttribute("aria-label", "受影響水桶與設定差異");
+    this.#impactList.hidden = true;
+    this.#status = element("p");
+    this.#status.setAttribute("role", "status");
+    const actions = element("div", "actions");
+    this.#apply = button("apply");
+    text(this.#apply, "套用整合設定");
+    this.#apply.disabled = true;
+    this.#apply.addEventListener("click", (event) => { if (event.isTrusted) void this.#save(); });
+    this.#reload = button();
+    text(this.#reload, "重新讀取（捨棄草稿）");
+    this.#reload.hidden = true;
+    this.#reload.addEventListener("click", (event) => { if (event.isTrusted) void this.#load(true); });
+    this.#review = button();
+    text(this.#review, "讀取目前設定（保留草稿）");
+    this.#review.hidden = true;
+    this.#review.addEventListener("click", (event) => { if (event.isTrusted) void this.#load(false, true); });
+    this.#currentValues = element("section", "section");
+    this.#currentValues.setAttribute("aria-label", "整合目前設定（唯讀）");
+    this.#currentValues.hidden = true;
+    this.#openInventory = button();
+    text(this.#openInventory, "編輯區域與水桶");
+    this.#openInventory.hidden = true;
+    this.#openInventory.addEventListener("click", (event) => { if (event.isTrusted) void this.#openTopology(); });
+    actions.append(this.#apply, this.#openInventory, this.#review, this.#reload);
+    footer.append(info, this.#impact, this.#impactList, this.#status, actions);
+    shell.append(footer, this.#currentValues, this.#content);
+    root.append(css, shell);
+  }
+
+  setConfig(config) {
+    if (config?.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
+    if (this.#configured) return;
+    this.#configured = true;
+    this.#start();
+  }
+
+  set hass(value) {
+    this.#hass = value;
+    const principal = editorPrincipal(value);
+    const transport = editorTransport(value);
+    const changedPrincipal = !sameContext(principal, this.#principal);
+    if (!changedPrincipal && sameContext(transport, this.#transport)) {
+      for (const picker of this.#content.querySelectorAll("ha-entity-picker")) picker.hass = value;
+      return;
+    }
+    this.#principal = principal;
+    this.#transport = transport;
+    ++this.#epoch;
+    this.#needsRead = true;
+    this.#clearCurrentValues();
+    if (changedPrincipal) this.#purge();
+    else if (this.#flight?.sent && this.#snapshot === this.#flight.baseline) {
+      this.#problem = SETTINGS_MESSAGES.readback_required;
+    }
+    this.#updateDraft();
+    this.#start();
+  }
+
+  connectedCallback() { this.#start(); }
+
+  disconnectedCallback() {
+    ++this.#epoch;
+    this.#needsRead = true;
+    this.#purge();
+    text(this.#status, "");
+  }
+
+  #start() {
+    if (!this.isConnected || !this.#configured) return;
+    const authorized = authorizedEditor(this.#principal);
+    this.#reload.hidden = !authorized || !readyTransport(this.#transport);
+    if (this.#reload.hidden) {
+      text(this.#status, !this.#hass?.user ? "正在等待 Home Assistant 連線…" : !authorized ? SETTINGS_MESSAGES.unauthorized :
+        "連線中斷，無法讀取設定。");
+      return;
+    }
+    if (this.#needsRead && !this.#flight) void this.#load();
+  }
+
+  #purge() {
+    this.#problem = undefined;
+    this.#conflict = undefined;
+    this.#snapshot = undefined;
+    this.#fields = undefined;
+    this.#topology = undefined;
+    this.#clearCurrentValues();
+    this.#content.replaceChildren();
+    this.#updateDraft();
+  }
+
+  #current(epoch) {
+    return epoch === this.#epoch && this.isConnected && this.#configured &&
+      authorizedEditor(this.#principal) && readyTransport(this.#transport) &&
+      sameContext(editorPrincipal(this.#hass), this.#principal) && sameContext(editorTransport(this.#hass), this.#transport);
+  }
+
+  async #discover(callWS, epoch, requireLoaded = true) {
+    const rows = await callWS({ type: "config_entries/get", domain: DOMAIN });
+    if (!this.#current(epoch)) throw settingsError("scope_changed");
+    if (!Array.isArray(rows) || rows.some((row) => row?.domain !== DOMAIN || !matchesId(row.entry_id, ENTRY_ID))) {
+      throw settingsError("entry_not_loaded");
+    }
+    if (rows.length > 1) throw settingsError("ambiguous_entry");
+    if (!rows.length || (requireLoaded && rows[0].state !== "loaded")) throw settingsError("entry_not_loaded");
+    return rows[0].entry_id;
+  }
+
+  async #read(callWS, epoch, entry) {
+    if (!this.#current(epoch)) throw settingsError("scope_changed");
+    const value = await callWS({ type: `${DOMAIN}/config_get`, version: 1, entry_id: entry });
+    if (!this.#current(epoch) || await this.#discover(callWS, epoch) !== entry) throw settingsError("scope_changed");
+    return readSettingsDto(value, entry);
+  }
+
+  async #readTopology(callWS, epoch, entry) {
+    if (!this.#current(epoch)) throw settingsError("scope_changed");
+    const value = await callWS({ type: `${DOMAIN}/topology_get`, version: 1, entry_id: entry });
+    if (!this.#current(epoch) || await this.#discover(callWS, epoch) !== entry) throw settingsError("scope_changed");
+    return readTopologyDto(value, entry);
+  }
+
+  async #loadPicker() {
+    if (customElements.get("ha-entity-picker")) return;
+    // HA lazy-loads picker code through its own selector. Don't import a
+    // version-specific frontend bundle or touch Lovelace's dialog internals.
+    if (!customElements.get("ha-selector")) throw settingsError("topology_picker_unavailable");
+    const loader = element("ha-selector");
+    loader.hass = this.#hass;
+    loader.hidden = true;
+    loader.disabled = true;
+    loader.selector = { entity: { filter: [{ domain: "sensor" }] } };
+    this.#content.append(loader);
+    let timeout;
+    try {
+      await Promise.race([customElements.whenDefined("ha-entity-picker"), new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(settingsError("topology_picker_unavailable")), 5000);
+      })]);
+    } finally {
+      clearTimeout(timeout);
+      loader.remove();
+    }
+  }
+
+  async #openTopology() {
+    const epoch = this.#epoch;
+    if (!this.#current(epoch) || this.#flight || this.#topology) return;
+    const flight = this.#flight = {};
+    const callWS = this.#transport[3].bind(this.#hass);
+    this.#updateDraft();
+    try {
+      const entry = await this.#discover(callWS, epoch, false);
+      const topology = await this.#readTopology(callWS, epoch, entry);
+      if (!this.#current(epoch)) return;
+      const baseline = this.#snapshot ?? await this.#read(callWS, epoch, entry);
+      if (!this.#current(epoch) || entry !== baseline.entry_id) throw settingsError("scope_changed");
+      const conflict = settingsConflict(baseline, topology);
+      if (conflict) throw settingsError(conflict);
+      await this.#loadPicker();
+      if (!this.#current(epoch)) return;
+      if (!this.#snapshot) {
+        this.#needsRead = false;
+        this.#mountSettings(baseline);
+      }
+      this.#setTopology(topology);
+      text(this.#status, "");
+    } catch (error) {
+      this.#issue(error, epoch, undefined, true);
+    } finally {
+      this.#finish(flight, epoch);
+    }
+  }
+
+  #issue(error, epoch, write, requestedTopology = !!this.#topology) {
+    if (!this.#current(epoch)) return;
+    const code = error?.code;
+    if (["unauthorized", "entry_not_loaded", "ambiguous_entry", "scope_changed"].includes(code)) this.#purge();
+    if (code === "unauthorized") this.#reload.hidden = true;
+    const definitive = ["stale_revision", "stale_source", "unauthorized", "entry_not_loaded", "settings_unavailable",
+      "protected_topology", "binding_conflict", "removal_confirmation_required", "topology_not_enrolled",
+      "topology_restart_required", "topology_recovery_required"].includes(code);
+    const message = write?.sent && !definitive ? SETTINGS_MESSAGES.readback_required :
+      Object.hasOwn(SETTINGS_MESSAGES, code) ? SETTINGS_MESSAGES[code] : "無法讀取或套用整合設定，請重新讀取後核對。";
+    const stale = code === "stale_revision" || code === "stale_source";
+    if ((write || stale) && this.#snapshot) this.#problem = message;
+    if (stale && this.#snapshot) this.#conflict = { topology: requestedTopology };
+    text(this.#status, message);
+  }
+
+  #finish(flight, epoch) {
+    if (this.#flight !== flight) return;
+    this.#flight = undefined;
+    this.#updateDraft();
+    if (epoch !== this.#epoch) this.#start();
+  }
+
+  async #load(discard = false, review = false) {
+    const epoch = this.#epoch;
+    if (!this.#current(epoch) || this.#flight || this.#reload.hidden || review && !this.#conflict) return;
+    const flight = this.#flight = {};
+    const callWS = this.#transport[3].bind(this.#hass);
+    if (!review) this.#needsRead = true;
+    const reopenTopology = !!this.#topology;
+    const rereadTopology = reopenTopology || !!this.#conflict?.topology && !discard;
+    const draft = this.#draft();
+    if (discard || (!this.#problem && draft?.valid && !draft.dirty)) this.#purge();
+    this.#clearCurrentValues();
+    this.#updateDraft();
+    text(this.#status, "正在讀取整合設定…");
+    try {
+      const entry = await this.#discover(callWS, epoch);
+      if (!this.#current(epoch)) return;
+      if (this.#snapshot && this.#snapshot.entry_id !== entry) {
+        if (review) throw settingsError("scope_changed");
+        this.#purge();
+      }
+      const topology = rereadTopology ? await this.#readTopology(callWS, epoch, entry) : undefined;
+      const snapshot = await this.#read(callWS, epoch, entry);
+      if (!this.#current(epoch)) return;
+      if (topology) {
+        const split = settingsConflict(snapshot, topology);
+        if (split && this.#snapshot && !discard) {
+          // The current transport has revalidated both responses and their scope,
+          // but they cannot be combined. Display only the retained draft; a new
+          // explicit review must obtain a coherent pair before showing current values.
+          this.#needsRead = false;
+          this.#conflict = { topology: true };
+          const reason = split === "stale_source" ? "水桶來源已變更" : "設定已被變更";
+          const notice = `${reason}；兩次讀取不一致。草稿已保留，請再次讀取目前設定。`;
+          if (this.#problem === SETTINGS_MESSAGES.readback_required) {
+            text(this.#status, `${this.#problem} ${notice}`);
+          } else {
+            this.#problem = notice;
+            text(this.#status, notice);
+          }
+          return;
+        }
+        if (split || !sameJson(topologyLabels(snapshot.zones), topologyLabels(topology.zones))) {
+          throw settingsError("invalid_readback");
+        }
+      }
+      const baseline = this.#snapshot;
+      this.#needsRead = false;
+      if (!baseline) {
+        this.#mountSettings(snapshot);
+        if (topology && reopenTopology) this.#setTopology(topology);
+      }
+      // A same-owner read may unlock the draft; it cannot replace either CAS token.
+      else {
+        const code = settingsConflict(baseline, snapshot);
+        if (!this.#problem && code) {
+          this.#conflict = { topology: !!topology };
+          this.#problem = SETTINGS_MESSAGES[code];
+        }
+        if (this.#conflict) this.#showCurrentValues(snapshot, topology);
+      }
+      text(this.#status, this.#problem ?? "");
+    } catch (error) {
+      this.#issue(error, epoch);
+      if (this.#current(epoch) && this.#conflict && this.#status.textContent !== this.#problem) {
+        text(this.#status, `${this.#problem} ${this.#status.textContent}`);
+      }
+    } finally {
+      this.#finish(flight, epoch);
+    }
+  }
+
+  #clearCurrentValues() {
+    this.#currentValues.hidden = true;
+    this.#currentValues.replaceChildren();
+  }
+
+  #showCurrentValues(settings, topology) {
+    const line = (copy, tag = "p") => {
+      const node = element(tag);
+      text(node, copy);
+      return node;
+    };
+    const current = this.#currentValues;
+    current.replaceChildren(line("整合目前設定（唯讀）", "h2"),
+      line("原草稿保留在下方，不能直接重送。核對後請捨棄草稿，再重新輸入或明確選擇綁定。"));
+    const original = this.#snapshot;
+    if (original.revision !== settings.revision && original.source_snapshot !== settings.source_snapshot) {
+      current.append(line("設定版本與水桶來源都已變更。"));
+    }
+    for (const kind of policyKinds) current.append(line(`共用${POLICY[kind].label}：${settingsPairText(kind, settings.common[kind])}`));
+    const bindings = new Map(topology?.zones.flatMap(z => z.tanks.map(t => [t.id, t])));
+    for (const [zi, zone] of settings.zones.entries()) {
+      current.append(line(`第 ${zi + 1} 區 · ${zone.name}`, "h3"));
+      for (const [ti, tank] of zone.tanks.entries()) {
+        const summary = element("div", "tank-settings");
+        summary.append(line(`第 ${ti + 1} 桶 · ${tank.name}`, "h4"),
+          line(`水位顯示量程：${tank.scale_max_m === null ? "未設定" : `${tank.scale_max_m} m`}`));
+        for (const kind of policyKinds) {
+          const { use_common, effective, local } = tank[kind];
+          summary.append(line(`${POLICY[kind].label}（${use_common ? "共用" : "個別"}）：${settingsPairText(kind, effective)}${
+            use_common ? `；保留的個別值：${settingsPairText(kind, local)}` : ""}`));
+        }
+        const bound = bindings.get(tank.id);
+        if (bound) for (const [role, label] of Object.entries(TOPOLOGY_ROLES)) {
+          const binding = bound[role];
+          summary.append(line(`${label}：${binding ? binding.entity_id ?? UNAVAILABLE_BINDING : "未設定"}`));
+        }
+        current.append(summary);
+      }
+    }
+    current.hidden = false;
+  }
+
+  #mountSettings(snapshot) {
+    this.#topology = undefined;
+    const section = element("section", "section");
+    const title = element("h2");
+    text(title, "補水參數");
+    const shared = element("section", "shared");
+    const sharedTitle = element("h3");
+    text(sharedTitle, "共用門檻與套用影響");
+    const note = element("p", "dim");
+    text(note, "共用值只影響選用該項共用設定的水桶；清除一組門檻時，請清空該組兩欄。");
+    const sharedGrid = element("div", "shared-grid");
+    const common = {};
+    for (const kind of policyKinds) {
+      common[kind] = pairFields(kind, snapshot.common[kind]);
+      sharedGrid.append(common[kind].frame);
+    }
+    shared.append(sharedTitle, note, sharedGrid);
+
+    const inventory = element("section", "section");
+    const heading = element("h2");
+    text(heading, "區域與水桶");
+    const help = element("p", "dim");
+    const link = element("a");
+    text(help, "在此編輯區桶草稿；安全驗證及已啟用控制的換綁仍由原生整合設定處理。");
+    text(link, "前往原生整合安全設定");
+    link.href = OPTIONS_PATH;
+    const topology = element("div", "editor-content");
+    inventory.append(heading, help, link, topology);
+    const tanks = new Map();
+    for (const zone of snapshot.zones) {
+      const group = element("section", "zone-settings");
+      const name = element("h3");
+      text(name, `${zone.name} · ${zone.tanks.length} 桶`);
+      group.append(name);
+      for (const [index, tank] of zone.tanks.entries()) {
+        const row = element("section", "tank-settings");
+        row.dataset.tankId = tank.id;
+        const tankName = element("h4");
+        const label = zone.tanks.filter(({ name }) => name === tank.name).length > 1 ? `${tank.name}（第 ${index + 1} 桶）` : tank.name;
+        text(tankName, label);
+        tankName.id = `tank-${tank.id}`;
+        row.setAttribute("aria-labelledby", tankName.id);
+        const grid = element("div", "policy-grid");
+        const inputs = {};
+        for (const kind of policyKinds) {
+          inputs[kind] = pairFields(kind, tank[kind].effective, tank[kind]);
+          grid.append(inputs[kind].frame);
+        }
+        const scale = settingsNumber(tank.scale_max_m);
+        const savedScale = element("p", "dim");
+        text(savedScale, tank.scale_max_m === null ? `目前套用：${NO_SCALE}` : `目前套用：${scaleText(tank.scale_max_m)}`);
+        const scaleNote = element("p", "dim");
+        text(scaleNote, "留空則不顯示填水比例；量程是水位高度，不是容量，也不改變門檻。");
+        row.append(tankName, grid, labeledControl("水位顯示量程上限（m）", scale), savedScale, scaleNote);
+        group.append(row);
+        tanks.set(tank.id, { row, inputs, scale, savedScaleText: scale.value, target: `${zone.name} · ${label}` });
+      }
+      inventory.append(group);
+    }
+    section.append(title, shared, inventory);
+    this.#snapshot = snapshot;
+    this.#fields = { common, tanks, topology };
+    this.#content.replaceChildren(section);
+    this.#updateDraft();
+  }
+
+  #setTopology(baseline) {
+    const groups = element("div", "editor-content");
+    const removal = element("fieldset");
+    const legend = element("legend");
+    text(legend, "移除範圍確認");
+    const list = element("ul");
+    const confirm = element("input");
+    confirm.type = "checkbox";
+    removal.append(legend, list, labeledControl("確認移除以上區域及水桶", confirm));
+    removal.hidden = true;
+    this.#topology = { baseline, zones: structuredClone(baseline.zones), groups, removal, list, confirm };
+    this.#fields.topology.replaceChildren(groups, removal);
+    this.#renderTopology();
+  }
+
+  #renderTopology() {
+    const draft = this.#topology;
+    if (!draft) return;
+    const { groups, zones, baseline } = draft;
+    const blank = () => ({ id: null, name: "", protected: false, level_sensor: null, refill_switch: null, alarm_switch: null });
+    const action = (label, callback, fixed = false) => {
+      const node = button();
+      text(node, label);
+      node.dataset.topologyAction = fixed ? "fixed" : "editable";
+      node.addEventListener("click", (event) => {
+        if (!event.isTrusted || !node.isConnected || !this.#current(this.#epoch) || this.#topology !== draft ||
+            this.#flight || this.#needsRead || this.#problem) return;
+        callback();
+        this.#renderTopology();
+        this.#updateDraft();
+      });
+      return node;
+    };
+    const nameField = (label, row) => {
+      const input = element("input");
+      input.type = "text";
+      input.value = row.name;
+      input.addEventListener("input", () => { row.name = input.value; });
+      return labeledControl(label, input);
+    };
+    const candidates = new Map(baseline.candidates.map((row) => [row.entity_id, row]));
+    const zoneControls = zones.map((zone, zi) => {
+      const group = element("fieldset", "zone-settings");
+      const title = element("legend");
+      text(title, `第 ${zi + 1} 區`);
+      group.append(title, nameField("區域名稱", zone));
+      for (const [ti, tank] of zone.tanks.entries()) {
+        const tankGroup = element("fieldset", "tank-settings");
+        const tankTitle = element("legend");
+        text(tankTitle, `第 ${ti + 1} 桶`);
+        tankGroup.append(tankTitle, nameField("水桶名稱", tank));
+        for (const [role, label] of Object.entries(TOPOLOGY_ROLES)) {
+          const picker = element("ha-entity-picker");
+          const domain = role === "level_sensor" ? "sensor" : "switch";
+          const allowed = baseline.candidates.filter(r => r.entity_id.startsWith(`${domain}.`)).map(r => r.entity_id);
+          picker.dataset.role = role;
+          picker.dataset.protected = String(tank.protected);
+          picker.hass = this.#hass;
+          picker.label = label;
+          picker.required = role === "level_sensor";
+          picker.includeDomains = [domain];
+          picker.includeEntities = allowed;
+          picker.showEntityId = true;
+          const unavailable = element("p", "dim");
+          text(unavailable, `${label}：${UNAVAILABLE_BINDING}。`);
+          const clear = role === "level_sensor" || tank.protected ? undefined :
+            action(`清除無法使用的${label}`, () => { tank[role] = null; });
+          const showBinding = () => {
+            picker.value = tank[role]?.entity_id ?? undefined;
+            unavailable.hidden = tank[role]?.entity_id !== null;
+            if (clear) clear.hidden = unavailable.hidden;
+          };
+          showBinding();
+          picker.addEventListener("value-changed", (event) => {
+            event.stopPropagation();
+            const old = tank[role];
+            if (picker.isConnected && !picker.disabled && this.#current(this.#epoch) && this.#topology === draft &&
+                !this.#flight && !this.#needsRead && !this.#problem) {
+              const value = event.detail?.value;
+              if (!value && old?.entity_id !== null) tank[role] = null;
+              else if (value !== old?.entity_id && allowed.includes(value)) tank[role] = candidates.get(value);
+            }
+            showBinding();
+            this.#updateDraft();
+          });
+          tankGroup.append(picker, unavailable);
+          if (clear) tankGroup.append(clear);
+        }
+        const help = element("p", "dim");
+        if (tank.protected) {
+          text(help, "此水桶已啟用受保護控制。僅可改名；換綁或移除前，請前往原生整合安全設定。");
+        } else if (zone.tanks.length === 1) {
+          text(help, "每區須保留至少一桶；如有其他區域，可以移除此區。");
+        }
+        tankGroup.append(help, action("移除水桶", () => zone.tanks.splice(ti, 1), tank.protected || zone.tanks.length === 1));
+        group.append(tankGroup);
+      }
+      group.append(action("新增水桶", () => zone.tanks.push(blank())),
+        action("移除區域", () => zones.splice(zi, 1), zones.length === 1 || zone.tanks.some(t => t.protected)));
+      return group;
+    });
+    groups.replaceChildren(...zoneControls, action("新增區域", () => zones.push({ id: null, name: "", tanks: [blank()] })));
+  }
+
+  #topologyDraft() {
+    const draft = this.#topology;
+    if (!draft) return;
+    const before = draft.baseline.zones;
+    const zones = topologyShape(draft.zones);
+    const zoneIds = new Set(zones.map(z => z.id));
+    const tankIds = new Set(zones.flatMap(z => z.tanks.map(t => t.id)));
+    const removedZones = before.filter(z => !zoneIds.has(z.id));
+    const removedTanks = before.flatMap(z => z.tanks.filter(t => !tankIds.has(t.id)).map(t => [z, t]));
+    const remove = { zones: removedZones.map(z => z.id).sort(), tanks: removedTanks.map(([, t]) => t.id).sort() };
+    const labels = [
+      ...removedZones.map(z => `區域：${z.name}（第 ${before.indexOf(z) + 1} 區）`),
+      ...removedTanks.map(([z, t]) => `水桶：${z.name}（第 ${before.indexOf(z) + 1} 區） · ${t.name}（第 ${z.tanks.indexOf(t) + 1} 桶）`),
+    ];
+    const key = JSON.stringify(remove);
+    if (key !== draft.removalKey) {
+      draft.removalKey = key;
+      draft.confirm.checked = false;
+      draft.removal.hidden = labels.length === 0;
+      draft.list.replaceChildren(...labels.map(label => {
+        const li = element("li");
+        text(li, label);
+        return li;
+      }));
+    }
+    const validName = (name, old) => name === old || (topologyName(name) && name === name.trim() &&
+      [...name].length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/u.test(name));
+    let valid = !labels.length || draft.confirm.checked;
+    for (const z of zones) {
+      const previous = before.find(old => old.id === z.id);
+      valid &&= validName(z.name, previous?.name) && z.tanks.every(t => t.level_sensor &&
+        validName(t.name, previous?.tanks.find(old => old.id === t.id)?.name));
+    }
+    return { valid, zones, remove, tankIds, changed: !sameJson(zones, topologyShape(before)), labels };
+  }
+
+  #draft() {
+    const snapshot = this.#snapshot;
+    const fields = this.#fields;
+    if (!snapshot || !fields) return;
+    const common = {};
+    const expected = structuredClone(snapshot);
+    const topology = this.#topologyDraft();
+    let valid = topology?.valid ?? true;
+    const uses = { refill: 0, alarm: 0 };
+    const affected = [];
+    const rows = [];
+    for (const kind of policyKinds) {
+      const input = fields.common[kind];
+      const { pair, valid: pairValid } = draftPair(kind, input, snapshot.common[kind]);
+      valid &&= pairValid;
+      text(input.draft, !pairValid ? "請輸入完整且有效的門檻。" : "");
+      if (pairValid && !samePair(pair, snapshot.common[kind])) common[kind] = pair;
+      expected.common[kind] = pairValid ? pair : null;
+    }
+    snapshot.zones.forEach((zone, z) => zone.tanks.forEach((tank, t) => {
+      const field = fields.tanks.get(tank.id);
+      const removed = topology && !topology.tankIds.has(tank.id);
+      field.row.hidden = !!removed;
+      if (removed) return;
+      const { inputs, scale, savedScaleText, target } = field;
+      const next = expected.zones[z].tanks[t];
+      const row = { id: tank.id };
+      const differences = [];
+      for (const kind of policyKinds) {
+        const input = inputs[kind];
+        const policy = tank[kind];
+        const use_common = input.select.value === "common";
+        const { pair: local, valid: pairValid } = draftPair(kind, input, policy.local);
+        valid &&= pairValid;
+        input.pair.hidden = use_common;
+        if (use_common) {
+          ++uses[kind];
+          valid &&= expected.common[kind] !== null;
+        }
+        const effective = use_common ? expected.common[kind] : local;
+        const hint = !pairValid ? (use_common ? "個別草稿不完整；切回個別設定修正。" : "請輸入完整且有效的門檻。") :
+          effective ? POLICY[kind].describe(effective) : use_common ? "共用設定未設定" : "未設定";
+        text(input.draft, `草稿預覽：${hint}`);
+        if (use_common !== policy.use_common) (row[kind] ??= {}).use_common = use_common;
+        if (pairValid && !samePair(local, policy.local)) (row[kind] ??= {}).local = local;
+        if (pairValid && !samePair(effective, policy.effective)) {
+          differences.push(`${POLICY[kind].label}：${settingsPairText(kind, policy.effective)} → ${settingsPairText(kind, effective)}`);
+        } else if (row[kind]) {
+          differences.push(`${POLICY[kind].label}：${use_common !== policy.use_common ?
+            `改用${use_common ? "共用" : "個別"}設定` : "個別值已調整"}（生效值不變）`);
+        }
+        next[kind] = { use_common, local, effective };
+      }
+      const unchangedScale = scale.value === savedScaleText && !scale.validity.badInput;
+      const max = unchangedScale ? tank.scale_max_m : readNumber(scale);
+      const scaleValid = unchangedScale || (validScale(max) && (max === null || writableNumber(max)));
+      valid &&= scaleValid;
+      if (scaleValid && max !== tank.scale_max_m) {
+        row.scale_max_m = max;
+        const depth = (value) => value === null ? "未設定" : `${value} m`;
+        differences.push(`量程：${depth(tank.scale_max_m)} → ${depth(max)}`);
+      }
+      next.scale_max_m = max;
+      if (Object.keys(row).length > 1) rows.push(row);
+      if (differences.length) affected.push(`${target}：${differences.join("；")}`);
+    }));
+    const changes = {};
+    if (Object.keys(common).length) changes.common = common;
+    if (rows.length) changes.tanks = rows;
+    return { valid, changes, expected, uses, affected, topology,
+      dirty: !!topology?.changed || Object.keys(changes).length !== 0 };
+  }
+
+  #updateDraft() {
+    const draft = this.#draft();
+    const waiting = !!this.#flight || this.#needsRead;
+    this.#content.hidden = this.#needsRead;
+    this.#apply.disabled = waiting || !!this.#problem || !draft?.valid || !draft.dirty;
+    this.#reload.disabled = !!this.#flight;
+    this.#review.hidden = !this.#conflict || this.#reload.hidden || !this.#current(this.#epoch);
+    this.#review.disabled = !!this.#flight;
+    this.#openInventory.hidden = !this.#current(this.#epoch) || !!this.#topology;
+    this.#openInventory.disabled = !!this.#flight || !!this.#problem;
+    for (const control of this.#content.querySelectorAll("input,select,ha-entity-picker,[data-topology-action]")) {
+      const disabled = waiting || !!this.#conflict || control.dataset.protected === "true" || control.dataset.topologyAction === "fixed" ||
+        (control.dataset.topologyAction !== undefined || control.localName === "ha-entity-picker") && !!this.#problem;
+      if (control.disabled !== disabled) control.disabled = disabled;
+    }
+    text(this.#impact, draft && !this.#needsRead ? `參數影響 ${draft.affected.length} 桶 · 共用補水 ${draft.uses.refill} 桶 · 共用低液位告警 ${draft.uses.alarm} 桶${draft.topology?.changed ? " · 區桶或綁定有變更" : ""}${draft.valid ? "" : " · 請填寫有效欄位並確認移除範圍"}` : "");
+    const affected = this.#needsRead ? [] : draft?.affected ?? [];
+    this.#impactList.hidden = !affected.length;
+    const items = [...this.#impactList.children];
+    if (items.length !== affected.length || items.some((item, index) => item.textContent !== affected[index])) {
+      this.#impactList.replaceChildren(...affected.map((description) => {
+        const item = element("li");
+        text(item, description);
+        return item;
+      }));
+    }
+  }
+
+  async #save() {
+    const epoch = this.#epoch;
+    if (!this.#current(epoch) || this.#flight || this.#needsRead || this.#problem) return;
+    const baseline = this.#snapshot;
+    const draft = this.#draft();
+    if (!draft?.valid || !draft.dirty) return;
+    const topologyBaseline = this.#topology?.baseline;
+    const flight = this.#flight = { baseline, sent: false };
+    const callWS = this.#transport[3].bind(this.#hass);
+    this.#updateDraft();
+    text(this.#status, "正在套用並讀回整合設定…");
+    try {
+      const entry = await this.#discover(callWS, epoch);
+      if (!this.#current(epoch)) return;
+      if (entry !== baseline.entry_id) throw settingsError("scope_changed");
+      flight.sent = true;
+      const isTopology = !!draft.topology?.changed;
+      const result = await callWS({ type: `${DOMAIN}/${isTopology ? "topology_save" : "config_save"}`, version: 1, entry_id: entry,
+        if_revision: baseline.revision, if_source_snapshot: baseline.source_snapshot, changes: draft.changes,
+        ...(isTopology ? { zones: draft.topology.zones, remove: draft.topology.remove } : {}) });
+      if (!this.#current(epoch)) return;
+      const saved = isTopology ? readTopologyDto(result, entry) : readSettingsDto(result, entry);
+      const readback = await this.#read(callWS, epoch, entry);
+      if (!this.#current(epoch)) return;
+      if (isTopology) {
+        const topology = await this.#readTopology(callWS, epoch, entry);
+        if (!this.#current(epoch)) return;
+        verifyTopologySave(draft, saved, readback, topology, topologyBaseline);
+        this.#mountSettings(readback);
+        this.#setTopology(topology);
+      } else {
+        draft.expected.revision = saved.revision;
+        if (saved.revision === baseline.revision || !sameJson(saved, draft.expected) || !sameJson(readback, saved)) {
+          throw settingsError("readback_required");
+        }
+        this.#mountSettings(readback);
+        if (topologyBaseline) this.#setTopology({ ...topologyBaseline, revision: saved.revision });
+      }
+      text(this.#status, APPLIED);
+    } catch (error) {
+      this.#issue(error, epoch, flight);
+    } finally {
+      this.#finish(flight, epoch);
+    }
+  }
+}
+
+if (!customElements.get(EDITOR_TAG)) customElements.define(EDITOR_TAG, UninusWaterDashboardEditor);
 if (!customElements.get(TAG)) customElements.define(TAG, UninusWaterDashboard);
 const picker = window.customCards ??= [];
 if (!picker.some((card) => card.type === TAG)) {

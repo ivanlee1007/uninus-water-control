@@ -1,2 +1,4 @@
 home-assistant-frontend==20251203.0
 playwright==1.56.0
+cronsim==2.7
+securetar==2025.2.1

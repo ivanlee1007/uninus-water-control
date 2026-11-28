@@ -1,4 +1,4 @@
-"""P4 through real HA Options, registry, state machine, and elapsed timers."""
+"""Thresholds through registered Settings WS, native Options, registry and timers."""
 
 import asyncio
 import json
@@ -14,11 +14,13 @@ from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntryState
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.data_entry_flow import FlowResultType, InvalidData
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import frame
 from homeassistant.util import dt as dt_util
+
+from water_settings_ws import compare, settings_client
 
 DOMAIN = "uninus_water_control"
 SOURCE = Path(__file__).resolve().parents[1] / "custom_components" / DOMAIN
@@ -84,14 +86,52 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(operation, menu["menu_options"])
         return await self.submit(await self.submit(menu, next_step_id=operation), **target)
 
+    async def settings(self):
+        request, _ = await settings_client(self.hass, self.entry)
+        reply = await request("get")
+        self.assertTrue(reply["success"], reply)
+        return request, reply["result"]
+
+    async def setting_target(self, kind, tank=None):
+        request, base = await self.settings()
+        return request, base, kind, tank or self.tank
+
     async def thresholds(self, tank=None):
-        return await self.select("edit_thresholds", tank_id=tank or self.tank)
+        return await self.setting_target("thresholds", tank)
+
+    async def scale(self):
+        return await self.setting_target("scale")
+
+    async def submit_setting(self, target, **fields):
+        request, base, kind, ident = target
+        if kind == "scale":
+            patch = {"scale_max_m": fields.get("scale_max_m")}
+        else:
+            patch = {
+                name: {"local": [fields[k] for k in keys if k in fields] or None}
+                for name, keys in {
+                    "refill": ("refill_lower_m", "refill_upper_m"),
+                    "alarm": ("alarm_lower_m", "alarm_delay_seconds"),
+                }.items()
+            }
+        return await request("save", **compare(base), changes={"tanks": [{"id": ident, **patch}]})
 
     async def save(self, form, **fields):
-        result = await self.submit(form, **fields)
-        self.assertEqual(result["type"], FlowResultType.CREATE_ENTRY, result)
+        if isinstance(form, tuple):
+            result = await self.submit_setting(form, **fields)
+            self.assertTrue(result["success"], result)
+        else:
+            result = await self.submit(form, **fields)
+            self.assertEqual(result["type"], FlowResultType.CREATE_ENTRY, result)
         await self.hass.async_block_till_done()
         self.assertEqual(self.entry.state, ConfigEntryState.LOADED)
+
+    def settings_path(self):
+        return self.root / ".storage" / f"{DOMAIN}.settings.{self.entry.entry_id}"
+
+    def effective_policy(self):
+        tank, *_ = self.entry.runtime_data.zones[0]["tanks"]
+        return self.entry.runtime_data.settings.with_thresholds(tank)["thresholds"]
 
     def entity(self, domain, suffix, tank=None):
         return self.registry.async_get_entity_id(domain, DOMAIN, f"{tank or self.tank}_{suffix}")
@@ -144,7 +184,7 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         calls = self.calls.copy()
         self.assertEqual(len(calls), 1)
 
-        form = await self.select("edit_display_scale", tank_id=self.tank)
+        form = await self.scale()
         self.set_depth("0.5")
         await self.hass.async_block_till_done()
         interval, timer = alarm._interval, alarm._cancel_timer
@@ -177,13 +217,14 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
     async def test_display_scale_is_independent_of_thresholds_and_projects_on_level_only(self):
         await self.save(await self.thresholds(), **REFILL, **ALARM)
         level = self.registry.async_get_entity_id("sensor", DOMAIN, self.tank)
-        form = await self.select("edit_display_scale", tank_id=self.tank)
-        rejected = await self.submit(form, scale_max_m=0)
-        self.assertEqual(rejected["errors"], {"scale_max_m": "positive_display_scale"})
-        await self.save(rejected, scale_max_m=2.5)
-        tank = self.entry.options["zones"][0]["tanks"][0]
-        self.assertEqual(self.entry.data["display_scales_m"], {self.tank: 2.5})
-        self.assertEqual(tank["thresholds"], REFILL | ALARM)
+        form = await self.scale()
+        rejected = await self.submit_setting(form, scale_max_m=0)
+        self.assertEqual(rejected["error"]["code"], "invalid_format")
+        await self.save(form, scale_max_m=2.5)
+        request, current = await self.settings()
+        self.assertEqual(current["zones"][0]["tanks"][0]["scale_max_m"], 2.5)
+        self.assertNotIn("display_scales_m", self.entry.data)
+        self.assertEqual(self.effective_policy(), REFILL | ALARM)
         self.assertEqual(self.hass.states.get(level).attributes["uninus_water_display"], {
             "version": 1, "scale_max_m": 2.5,
             "refill": (REFILL["refill_lower_m"], REFILL["refill_upper_m"]),
@@ -192,31 +233,30 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         self.set_depth("unavailable")
         await self.hass.async_block_till_done()
         self.assertEqual(self.hass.states.get(level).attributes["uninus_water_display"]["scale_max_m"], 2.5)
-        await self.save(await self.select("edit_display_scale", tank_id=self.tank))
+        await self.save(await self.scale())
         self.assertNotIn("display_scales_m", self.entry.data)
-        self.assertEqual(self.entry.options["zones"][0]["tanks"][0]["thresholds"], REFILL | ALARM)
+        self.assertEqual(self.effective_policy(), REFILL | ALARM)
         self.assertFalse(self.calls)
 
     async def test_display_scale_and_unrelated_options_keep_native_stale_cas_and_reload(self):
         owner = self.entry.runtime_data
         options = self.entry.options
         stale_rename = await self.select("edit_zone", zone_id=self.zone["id"])
-        first_scale = await self.select("edit_display_scale", tank_id=self.tank)
-        stale_scale = await self.select("edit_display_scale", tank_id=self.tank)
+        first_scale = await self.scale()
+        stale_scale = await self.scale()
         await self.save(first_scale, scale_max_m=2.5)
         self.assertIs(self.entry.runtime_data, owner)
         self.assertIs(self.entry.options, options)
-        for draft, fields in ((stale_rename, {"zone_name": "Stale"}),
-                              (stale_scale, {"scale_max_m": 8})):
-            result = await self.submit(draft, **fields)
-            self.assertEqual((result["type"], result["reason"]), (FlowResultType.ABORT, "configuration_changed"))
-        stale_scale = await self.select("edit_display_scale", tank_id=self.tank)
+        result = await self.submit(stale_rename, zone_name="Stale")
+        self.assertEqual((result["type"], result["reason"]), (FlowResultType.ABORT, "configuration_changed"))
+        self.assertEqual((await self.submit_setting(stale_scale, scale_max_m=8))["error"]["code"], "stale_revision")
+        stale_scale = await self.scale()
         await self.save(await self.select("edit_zone", zone_id=self.zone["id"]), zone_name="Renamed")
         self.assertIsNot(self.entry.runtime_data, owner)
-        result = await self.submit(stale_scale, scale_max_m=8)
-        self.assertEqual((result["type"], result["reason"]), (FlowResultType.ABORT, "configuration_changed"))
+        self.assertEqual((await self.submit_setting(stale_scale, scale_max_m=8))["error"]["code"], "stale_revision")
         self.assertEqual(self.entry.options["zones"][0]["name"], "Renamed")
-        self.assertEqual(self.entry.data["display_scales_m"], {self.tank: 2.5})
+        _, current = await self.settings()
+        self.assertEqual(current["zones"][0]["tanks"][0]["scale_max_m"], 2.5)
         self.assertFalse(self.calls)
 
     async def test_native_refill_preview_persists_and_compares_both_inclusive_bounds(self):
@@ -225,7 +265,7 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         await self.save(await self.thresholds(), **REFILL)
         entity = self.entity("sensor", "refill_preview")
         self.assertIsNone(self.entity("binary_sensor", "low_level_alarm"))
-        self.assertEqual(self.entry.options["zones"][0]["tanks"][0]["thresholds"], REFILL)
+        self.assertEqual(self.effective_policy(), REFILL)
         for value, unit, expected in (
             ("125", "cm", "refill_threshold"), ("1.2499", "m", "refill_threshold"),
             ("1251", "mm", "between_thresholds"), ("239.99", "cm", "between_thresholds"),
@@ -243,7 +283,9 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         await self.hass.async_stop()
         store = json.loads((self.root / ".storage" / "core.config_entries").read_text(encoding="utf-8"))
         saved, = store["data"]["entries"]
-        self.assertEqual(saved["options"]["zones"][0]["tanks"][0]["thresholds"], REFILL)
+        self.assertEqual(saved["options"], {})
+        overlay = json.loads(self.settings_path().read_text(encoding="utf-8"))["data"]
+        self.assertEqual(overlay["tanks"][0]["refill"], {"local": list(REFILL.values()), "use_common": False})
         await self.boot()
         self.entry = self.hass.config_entries.async_get_entry(entry_id)
         self.assertTrue(await self.hass.config_entries.async_setup(entry_id))
@@ -257,7 +299,7 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_alarm_only_waits_for_continuous_equality_and_resets_on_same_turn_invalid(self):
         await self.save(await self.thresholds(), **ALARM)
-        self.assertEqual(self.entry.options["zones"][0]["tanks"][0]["thresholds"], ALARM)
+        self.assertEqual(self.effective_policy(), ALARM)
         self.assertIsNone(self.entity("sensor", "refill_preview"))
         entity = self.entity("binary_sensor", "low_level_alarm")
         self.assert_state(entity, "off")
@@ -291,17 +333,13 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
             (ALARM | {"alarm_delay_seconds": 0}, "alarm_delay_seconds", "positive_whole_delay"),
             (ALARM | {"alarm_delay_seconds": 1.5}, "alarm_delay_seconds", "positive_whole_delay"),
         )
-        for values, field, error in cases:
+        for values in [case[0] for case in cases] + [ALARM | {"alarm_delay_seconds": True},
+                                                       REFILL | {"refill_upper_m": 10**500}]:
             with self.subTest(values=values):
-                rejected = await self.submit(await self.thresholds(), **values)
-                self.assertEqual(rejected["type"], FlowResultType.FORM)
-                self.assertEqual(rejected["errors"], {field: error})
+                rejected = await self.submit_setting(await self.thresholds(), **values)
+                self.assertEqual(rejected["error"]["code"], "invalid_format")
                 self.assertIs(self.entry.options, before)
-        with self.assertRaises(InvalidData):
-            await self.submit(await self.thresholds(), **(ALARM | {"alarm_delay_seconds": True}))
-        with self.assertRaises(InvalidData):
-            await self.submit(await self.thresholds(), **(REFILL | {"refill_upper_m": 10**500}))
-        self.assertIs(self.entry.options, before)
+                self.assertFalse(self.settings_path().exists())
         self.assertEqual(self.calls, [])
 
     async def test_fractional_source_units_preserve_exact_boundary_and_nearby_values(self):
@@ -353,9 +391,15 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         self.assert_state(alarm, "unavailable")
         self.assert_state(peer_alarm, "off")
         await self.save(await self.select("edit_tank", tank_id=self.tank), tank_name="Renamed", level_sensor=self.probe)
-        self.assertEqual(self.entity("sensor", "refill_preview"), preview)
-        self.assertEqual(self.entity("binary_sensor", "low_level_alarm"), alarm)
-        self.assertEqual(self.entry.options["zones"][0]["tanks"][0]["thresholds"], REFILL | ALARM)
+        # A deliberate rebind is allowed, but a settings overlay for the old
+        # source isn't transferred. Explicitly configure the replacement.
+        self.assertIsNone(self.entity("sensor", "refill_preview"))
+        self.assertIsNone(self.entity("binary_sensor", "low_level_alarm"))
+        self.assertEqual(self.effective_policy(), {})
+        await self.save(await self.thresholds(), **(REFILL | ALARM))
+        preview = self.entity("sensor", "refill_preview")
+        alarm = self.entity("binary_sensor", "low_level_alarm")
+        self.assertEqual(self.effective_policy(), REFILL | ALARM)
         self.assert_state(preview, "refill_threshold")
         self.assert_state(alarm, "off")
         self.set_depth("1", entity_id=peer_source)

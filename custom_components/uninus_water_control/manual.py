@@ -14,6 +14,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_state_report_event
 
 from .inventory import DOMAIN, inventory
+from .topology_lifecycle import witness
 from .sensor import _level_metres
 
 if TYPE_CHECKING:
@@ -55,8 +56,12 @@ def output_conflicts(registry: er.EntityRegistry, zones: list, tank_id: str, rol
                     continue
                 if not (ident := tank.get(f"{other_role}_switch")):
                     continue
-                other = registry.async_get(tank.get(f"{other_role}_switch_registry_id", ident))
-                if ident == row.entity_id or (
+                other_id = tank.get(f"{other_role}_switch_registry_id")
+                other = registry.async_get(other_id or ident)
+                # A resolved binding owns its current name, not the old name
+                # now possibly held by a distinct device. Without a resolved
+                # identity, retain the conservative saved-name collision gate.
+                if (other.entity_id if other else ident) == row.entity_id or other_id == row.id or (
                     other is not None
                     and (other.id == row.id or (row.device_id is not None and row.device_id == other.device_id))
                 ):
@@ -79,18 +84,20 @@ def source_conflicts(zones: list, tank_id: str, row) -> bool:
 class ManualController:
     """Own role lifetimes without exposing a raw service or caller-selected target."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, settings=None):
         self.hass = hass
         self.entry = entry
         self.options = entry.options
+        self.settings = settings
+        self.enrollment = settings.enrollment if settings else None
         self.registry = er.async_get(hass)
-        self.zones = inventory(entry)
+        self.zones = settings.zones if settings else inventory(entry)
         self.retiring = False
         self.restart_required = False
         self.shutdown_deadline: float | None = None
         self.tank = None
         self.roles: dict[str, ManualRole] = {}
-        manual = entry.options.get("manual") or {}
+        manual = settings.manual if settings else entry.options.get("manual") or {}
         self.tank_id = manual.get("tank_id")
         self.labels = {}
         for zone in self.zones:
@@ -130,6 +137,10 @@ class ManualController:
     @property
     def off_attempt_allowed(self) -> bool:
         return self.shutdown_deadline is None or self.hass.loop.time() < self.shutdown_deadline
+
+    def start_authorized(self) -> bool:
+        return (witness(self.entry) == self.enrollment
+                and (self.settings is None or not self.settings.topology_busy))
 
     @callback
     def _registry_changed(self, event):
@@ -282,6 +293,7 @@ class ManualRole:
             self.hass.is_running
             and not self.owner.retiring
             and self.owner.entry.options is self.owner.options
+            and self.owner.start_authorized()
             and not self.fault
             and self.closed
             and self.source_healthy()
@@ -478,6 +490,7 @@ class ManualRole:
                 and self.hass.is_running
                 and not self.owner.retiring
                 and self.owner.entry.options is self.owner.options
+                and self.owner.start_authorized()
                 and self.output_safe()
                 and self.source_healthy()
                 and self.actual == STATE_OFF

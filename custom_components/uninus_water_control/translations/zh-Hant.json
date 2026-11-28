@@ -34,8 +34,23 @@
         "menu_options": {
           "add_zone": "新增區域", "edit_zone": "重新命名區域", "remove_zone": "移除區域",
           "add_tank": "新增水箱", "edit_tank": "編輯水箱", "remove_tank": "移除水箱",
-          "edit_thresholds": "編輯門檻預覽", "edit_display_scale": "編輯水位顯示量程"
+          "card_settings": "門檻與量程：儀表板卡片編輯器",
+          "enroll_topology": "將區域與水箱移轉至整合儲存",
+          "topology_status": "區域與水箱移轉狀態"
         }
+      },
+      "topology_not_requested": {
+        "title": "尚未申請移轉",
+        "description": "控制器仍使用原有設定。從舊版整合更新前，請先保留一份已驗證、更新前製作的 Home Assistant 設定備份。移轉期間請保持裝置側獨立關斷。"
+      },
+      "topology_owned_active": {
+        "title": "移轉完成",
+        "description": "整合已載入，且已核對磁碟中的區域與水箱設定。請現在前往「設定 → 系統 → 備份」，建立並下載相符的 Home Assistant 設定備份。此狀態不能驗證實體設備或證明設備已關閉。"
+      },
+      "enroll_topology": {
+        "title": "準備移轉區域與水箱",
+        "description": "先確認 Home Assistant 備份可用，預留兩次完整重啟 Core 的維護時間，並保持裝置側獨立關斷。送出申請不代表移轉完成，也不代表設備實際已關閉。",
+        "data": {"confirm_device_cutoff": "我已驗證備份，並獨立確認關斷保護及設備的實際安全狀態"}
       },
       "add_zone": {
         "title": "新增區域及其第一個水箱",
@@ -70,21 +85,6 @@
           "confirm_device_cutoff": "請實地確認輸出對應，並確認沒有其他控制器操作同一輸出。每個啟用的裝置都必須能在不依賴 Home Assistant 或網路的情況下安全關斷。勾選不代表已測試硬體；若無法驗證，請勿啟用。"
         }
       },
-      "save_display_scale": {
-        "title": "水位顯示量程",
-        "description": "設定 {target} 由零起算的顯示上限。留空可移除量程；此設定不是容量、門檻或控制設定。",
-        "data": {"scale_max_m": "顯示量程上限"}
-      },
-      "save_thresholds": {
-        "title": "唯讀門檻預覽",
-        "description": "已選擇：{target}。每項功能請填寫兩個欄位；兩欄都留空即停用該功能。此預覽不操作開關，也不傳送通知。",
-        "data": {
-          "refill_lower_m": "補水下限",
-          "refill_upper_m": "停止上限",
-          "alarm_lower_m": "低液位告警下限",
-          "alarm_delay_seconds": "連續低液位告警延遲"
-        }
-      },
       "confirm_remove": {
         "title": "確認移除",
         "description": "確定要移除 {target} 嗎？移除區域時，該區域的所有水箱也會從此整合移除。來源感測器與開關不會變更。",
@@ -105,20 +105,26 @@
       "shared_output": "另一用途已參照此輸出或裝置；請先確認現場對應，排除共用。",
       "output_source_changed": "使用此實體 ID 的開關已變更。請重新開啟表單並選擇正確的開關。",
       "whole_seconds_required": "請輸入整數秒數。",
-      "finite_threshold_required": "請輸入有限數值。",
-      "threshold_pair_required": "請填寫該功能的兩個欄位，或將兩欄都清空以停用。",
-      "threshold_order": "停止上限必須高於補水下限。",
-      "positive_display_scale": "請輸入大於零的有限數值，或留空。",
-      "positive_whole_delay": "請輸入至少 1 秒的整數。",
       "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
     },
     "abort": {
+      "card_settings_in_dashboard_editor": "在儀表板選擇「編輯儀表板」，再編輯補水控制卡片。在視覺化卡片編輯器選擇「套用整合設定」。",
+      "entry_not_loaded": "控制器未載入。載入後請重新開啟「設定」。",
+      "topology_admin_required": "請由啟用中的管理員重新開啟此表單。",
+      "topology_writer_unavailable": "目前無法編輯整合設定。請檢查控制器狀態與移轉復原說明。",
+      "topology_restart_required": "移轉尚未完成。請保持裝置側獨立關斷、完整重啟 Home Assistant Core（不是重新載入整合），再開啟「設定」查看狀態。若顯示需要復原，請改依備份復原說明處理。",
+      "topology_recovery_required": "需要復原區域與水箱設定。請使用裝置側獨立關斷並確認實際狀態，不要在 Home Assistant 猜測應操作哪一個輸出。請由管理員在「設定 → 系統 → 備份」完整還原相符的 Home Assistant 設定備份；還原可能覆蓋其他設定。請勿混用備份或自行複製個別儲存檔。",
+      "readback_required": "無法確認寫入結果，不會套用舊設定。請保持裝置側關斷，先確認控制器狀態，再決定是否重試。",
       "configuration_changed": "此表單開啟後，設定已變更。請重新開啟「設定」並再試一次。",
       "manual_outputs_unsettled": "請先停止手動控制，並等待關閉回報及未完成指令，再編輯設定。",
       "invalid_target": "所選區域或水箱不存在。",
       "minimum_zones": "控制器必須至少包含一個區域。",
       "minimum_tanks": "每個區域必須至少包含一個水箱。若要移除整個區域，請使用「移除區域」。"
     }
+  },
+  "exceptions": {
+    "topology_restart_required": {"message": "移轉需要再完整重啟一次 Home Assistant。請保持裝置側關斷。"},
+    "topology_recovery_required": {"message": "需要復原區域與水箱設定。請使用裝置側獨立關斷並確認實際狀態。請由管理員在「設定 → 系統 → 備份」完整還原相符的 Home Assistant 設定備份；還原可能覆蓋其他設定。請勿混用不同時間的備份。"}
   },
   "entity": {
     "sensor": {

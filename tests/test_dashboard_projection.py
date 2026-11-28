@@ -125,6 +125,7 @@ class DashboardProjectionTest(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual(float(state.state), expected_state)
                 self.assertEqual(dict(state.attributes), {
+                    "uninus_water_settings_entry": entry.entry_id,
                     ATTR_DASHBOARD: {
                         "version": 1,
                         "zone": {"id": zone["id"], "name": zone["name"], "index": zone_index},

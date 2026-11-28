@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -28,8 +29,11 @@ os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 from homeassistant import bootstrap, loader
 from homeassistant.auth.const import GROUP_ID_ADMIN
+from homeassistant.components.recorder import get_instance as get_recorder
+from homeassistant.components.recorder.tasks import SynchronizeTask
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant, ServiceRegistry
+from homeassistant.const import EVENT_CALL_SERVICE
+from homeassistant.core import HomeAssistant, ServiceRegistry, callback
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from playwright.async_api import async_playwright, expect
@@ -38,10 +42,13 @@ ROOT = Path(__file__).resolve().parents[1]
 DOMAIN = "uninus_water_control"
 TITLE = "水量總覽驗證"
 CARD_TAG = "uninus-water-dashboard"
+EDITOR_TAG = f"{CARD_TAG}-editor"
 URL_PATH = "/uninus_water_control/dashboard.js"
 MANUAL = "uninus_water_manual"
 PREVIEW = "uninus_water_thresholds"
 OUTPUTS = {role: f"switch.browser_{role}" for role in ("refill", "alarm")}
+PASSIVE_ALARM = "switch.browser_passive_history"
+ALARM_HISTORY_GET = f"{DOMAIN}/alarm_history_get"
 
 
 class SyntheticOutputs:
@@ -148,13 +155,14 @@ async def native_entry(hass):
     return entry
 
 
-async def native_add_tank(hass, entry, number: int) -> None:
+async def native_add_tank(hass, entry, number: int, alarm=None) -> None:
     menu = await hass.config_entries.options.async_init(entry.entry_id)
     select = await hass.config_entries.options.async_configure(menu["flow_id"], {"next_step_id": "add_tank"})
     zone = next(iter(entry.options.get("zones", entry.data["zones"])))
     form = await hass.config_entries.options.async_configure(select["flow_id"], {"zone_id": zone["id"]})
     result = await hass.config_entries.options.async_configure(form["flow_id"], {
         "tank_name": f"第 {number} 桶", "level_sensor": f"sensor.test_depth_{number}",
+        **({"alarm_switch": alarm} if alarm else {}),
     })
     assert result["type"] == FlowResultType.CREATE_ENTRY, result
     await hass.async_block_till_done()
@@ -206,34 +214,36 @@ async def seed_reference_layout(hass, entry):
     assert [float(state.state) for state in levels] == [float(value) for value in REFERENCE_LEVELS], levels
 
 
-async def verify_browser_scale(options, base_url, shell, screenshot_dir):
-    await options.goto(f"{base_url}/config/integrations/integration/{DOMAIN}", wait_until="domcontentloaded")
+SETTINGS_CALL = "msg => document.querySelector('home-assistant').hass.callWS(msg)"
 
-    async def open_form():
-        await options.get_by_role("button", name="Configure", exact=True).press("Enter")
-        await options.get_by_text("Edit water-level display scale", exact=True).click()
-        await options.locator("ha-selector-select").get_by_role("combobox").click()
-        await options.get_by_role("option", name="1.1 · 育苗區 / 一號水桶 · sensor.test_depth_1", exact=True).click()
-        await options.get_by_role("button", name="Submit", exact=True).click()
-        await expect(options.get_by_role("alertdialog", name="Water-level display scale", exact=True)).to_be_visible()
-        return options.get_by_role("spinbutton", name="Display scale maximum", exact=True)
 
-    scale = await open_form()
-    await expect(scale).to_have_value("")
-    await scale.click()
-    await scale.press_sequentially("2.5")
-    await expect(scale).to_have_value("2.5")
-    if screenshot_dir:
-        await options.screenshot(path=screenshot_dir / "native-scale-options.png")
-    await options.get_by_role("button", name="Submit", exact=True).click()
-    await expect(options.get_by_text("Options successfully saved.", exact=True)).to_be_visible()
-    await options.get_by_role("button", name="Finish", exact=True).click()
+async def read_settings(page, entry):
+    return await page.evaluate(SETTINGS_CALL, {"type": f"{DOMAIN}/config_get", "version": 1, "entry_id": entry.entry_id})
+
+
+async def publish_settings(page, current, changes):
+    return await page.evaluate(SETTINGS_CALL, {
+        "type": f"{DOMAIN}/config_save", "version": 1, "entry_id": current["entry_id"],
+        "if_revision": current["revision"], "if_source_snapshot": current["source_snapshot"], "changes": changes,
+    })
+
+
+async def verify_browser_scale(options, base_url, shell, entry):
+    """Exercise the private RPC over native browser auth, not a mock UI."""
+    await native_login(options, base_url)
+    current = await read_settings(options, entry)
+    target = current["zones"][0]["tanks"][0]
+    assert target["scale_max_m"] is None
+    prior_options, owner = entry.options, entry.runtime_data
+    result = await publish_settings(options, current, {"tanks": [{"id": target["id"], "scale_max_m": 2.5}]})
+    assert result["revision"] != current["revision"]
     await expect(shell.get_by_role("meter", name="水位量程：0–2.5 m")).to_have_attribute("aria-valuemax", "2.5")
-    await options.reload(wait_until="domcontentloaded")
-    await expect(await open_form()).to_have_value("2.5")
+    await native_login(options, base_url)
+    assert await read_settings(options, entry) == result
+    assert entry.options is prior_options and entry.runtime_data is owner
     assert not await options.evaluate("window.waterTestUncaught")
     await options.close()
-    print("PASS: native display-scale Options select/type/save/reopen and live measured meter")
+    print("PASS: native browser-authenticated scale settings RPC, fresh readback and live measured meter")
 
 
 async def native_login(page, url: str) -> None:
@@ -350,22 +360,14 @@ async def verify_manual(page, shell, hass, entry, outputs, calls, screenshot_dir
 
 
 async def verify_threshold_previews(page, options, shell, hass, entry, outputs, calls, base_url, screenshot_dir):
-    """Only browser Options writes configuration; preview interactions only open native More info."""
-    fields = {
-        "Refill lower threshold": "1.25", "Stop upper threshold": "1.85",
-        "Low-level alarm threshold": "1.2", "Continuous low-level alarm delay": "4",
-    }
-    expected_settings = dict(zip(
-        ("refill_lower_m", "refill_upper_m", "alarm_lower_m", "alarm_delay_seconds"),
-        (1.25, 1.85, 1.2, 4), strict=True,
-    ))
+    """Use authenticated browser settings RPC; previews only open native More info."""
+    expected_settings = {"refill": [1.25, 1.85], "alarm": [1.2, 4]}
     zone = entry.options["zones"][0]
     tank_id = zone["tanks"][0]["id"]
-    manual_before = entry.options["manual"]
+    options_before, owner = entry.options, entry.runtime_data
     tank = shell.locator(f'[data-tank-id="{tank_id}"]')
     refill = tank.locator('[data-preview-kind="refill_preview"]')
     alarm = tank.locator('[data-preview-kind="low_level_alarm"]')
-    threshold_dialog = options.get_by_role("alertdialog", name="Read-only threshold previews", exact=True)
     await expect(shell.locator("[data-preview-kind]")).to_have_count(0)
     core_calls = []
 
@@ -379,17 +381,6 @@ async def verify_threshold_previews(page, options, shell, hass, entry, outputs, 
 
     observer = patch.object(ServiceRegistry, "async_call", record_service)
     browser_call_count = len(calls)
-
-    async def open_form():
-        # Activate the actual button; its slotted icon can intercept pointer hit-testing.
-        await options.get_by_role("button", name="Configure", exact=True).press("Enter")
-        await options.get_by_text("Edit threshold previews", exact=True).click()
-        picker = options.locator("ha-selector-select").get_by_role("combobox")
-        await picker.click()
-        await options.get_by_role("option", name="1.1 · 育苗區 / 一號水桶 · sensor.test_depth_1", exact=True).click()
-        await options.get_by_role("button", name="Submit", exact=True).click()
-        await expect(threshold_dialog).to_be_visible()
-        await expect(options.get_by_role("spinbutton")).to_have_count(len(fields))
 
     source = "sensor.test_depth_1"
 
@@ -410,28 +401,17 @@ async def verify_threshold_previews(page, options, shell, hass, entry, outputs, 
 
     observer.start()
     try:
-        await options.goto(f"{base_url}/config/integrations/integration/{DOMAIN}", wait_until="domcontentloaded")
-        await open_form()
-        for label, value in fields.items():
-            field = options.get_by_role("spinbutton", name=label, exact=True)
-            await expect(field).to_have_value("")
-            await field.click()
-            await field.press_sequentially(value)
-            await expect(field).to_have_value(value)
-        if screenshot_dir is not None:
-            await options.screenshot(path=screenshot_dir / "native-p4-options-filled.png")
-        await options.get_by_role("button", name="Submit", exact=True).click()
-        await expect(threshold_dialog).not_to_be_visible()
-        await expect(options.get_by_text("Options successfully saved.", exact=True)).to_be_visible()
-        await options.get_by_role("button", name="Finish", exact=True).click()
-        await expect(options.get_by_role("alertdialog", name="Success", exact=True)).not_to_be_visible()
-
-        # Establish producer truth independently of the live dashboard projection.
-        await hass.async_block_till_done()
+        await native_login(options, base_url)
+        original = await read_settings(options, entry)
+        assert all(original["zones"][0]["tanks"][0][kind]["effective"] is None for kind in expected_settings)
+        saved = await publish_settings(options, original, {"tanks": [{
+            "id": tank_id, **{kind: {"local": pair} for kind, pair in expected_settings.items()},
+        }]})
+        assert saved["revision"] != original["revision"]
         assert entry.state == ConfigEntryState.LOADED
-        assert entry.options["manual"] == manual_before
-        assert entry.options["zones"][0]["tanks"][0]["thresholds"] == expected_settings
-        assert all("thresholds" not in item for item in entry.options["zones"][0]["tanks"][1:])
+        assert entry.options is options_before and entry.runtime_data is owner
+        assert all(saved["zones"][0]["tanks"][0][kind]["effective"] == pair for kind, pair in expected_settings.items())
+        assert all(t["refill"]["effective"] is None and t["alarm"]["effective"] is None for t in saved["zones"][0]["tanks"][1:])
         native = {}
         for kind, domain in (("refill_preview", "sensor"), ("low_level_alarm", "binary_sensor")):
             entity = er.async_get(hass).async_get_entity_id(domain, DOMAIN, f"{tank_id}_{kind}")
@@ -444,13 +424,9 @@ async def verify_threshold_previews(page, options, shell, hass, entry, outputs, 
         await expect(alarm).to_be_visible()
         await expect(shell.locator("[data-preview-kind]")).to_have_count(2)
 
-        # Start a fresh Options frontend, rather than inheriting the closing dialog's state.
-        await options.reload(wait_until="domcontentloaded")
-        await open_form()
-        for label, value in fields.items():
-            await expect(options.get_by_role("spinbutton", name=label, exact=True)).to_have_value(value)
-        if screenshot_dir is not None:
-            await options.screenshot(path=screenshot_dir / "native-p4-options-reopened.png")
+        # A fresh frontend connection must read the same durable configuration.
+        await native_login(options, base_url)
+        assert await read_settings(options, entry) == saved
         assert not await options.evaluate("window.waterTestUncaught")
         await options.close()
 
@@ -516,17 +492,82 @@ async def verify_threshold_previews(page, options, shell, hass, entry, outputs, 
         assert not core_calls and len(calls) == browser_call_count and outputs.calls.empty(), (
             core_calls, calls[browser_call_count:],
         )
-        print("PASS: browser Options select/type/save/reopen; live refill boundaries, delayed preview alarm, unavailable and recovery; retained preview node/focus; native More info; zero preview browser service, switch or notification calls")
+        print("PASS: browser-authenticated settings RPC and fresh readback; live refill boundaries, delayed preview alarm, unavailable and recovery; retained preview node/focus; native More info; zero preview browser service, switch or notification calls")
     except Exception:
         if screenshot_dir is not None and not options.is_closed():
-            await options.screenshot(path=screenshot_dir / "native-p4-options-failure.png")
+            await options.screenshot(path=screenshot_dir / "native-p4-rpc-failure.png")
             print(await options.locator("body").aria_snapshot())
         raise
     finally:
         observer.stop()
 
 
-async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path | None, login_only: bool, reference: Path | None) -> None:
+async def verify_alarm_history(hass, entry, shell, outputs, wire, replies, screenshot_dir):
+    """Drive the mounted module over real HA WS and actual Recorder ingestion."""
+    rec = get_recorder(hass)
+    assert await asyncio.wait_for(asyncio.shield(rec.async_db_ready), 10)
+    zone, = entry.options.get("zones", entry.data["zones"])
+    target = next(tank for tank in zone["tanks"] if tank.get("alarm_switch") == PASSIVE_ALARM)
+    original_options = entry.options
+    store = Path(entry.runtime_data.settings.store.path)
+    store_before = store.read_bytes() if store.exists() else None
+    service_calls = []
+
+    @callback
+    def observe(event):
+        service_calls.append((event.data["domain"], event.data["service"]))
+
+    unsub = hass.bus.async_listen(EVENT_CALL_SERVICE, observe)
+    try:
+        samples = []
+        for value in ("off", "on", "off"):
+            hass.states.async_set(PASSIVE_ALARM, value)
+            samples.append(hass.states.get(PASSIVE_ALARM).last_changed.isoformat(timespec="microseconds").replace("+00:00", "Z"))
+            await asyncio.sleep(0.01)
+        committed = hass.loop.create_future()
+        rec.queue_task(SynchronizeTask(committed))
+        await asyncio.wait_for(committed, 10)
+        await shell.get_by_role("button", name="補水參數", exact=True).click()
+        panel = shell.get_by_role("region", name="告警輸出紀錄")
+        await expect(panel).to_be_visible()
+        pick = panel.get_by_label("選擇水桶")
+        await pick.select_option(label="育苗區 · 第 2 桶")
+        assert not wire
+        await panel.get_by_role("button", name="重新整理紀錄").click()
+        await expect(panel.get_by_role("listitem")).to_have_count(2)
+        assert len(wire) == 1
+        request = wire[0]
+        assert request == {"id": request["id"], "type": ALARM_HISTORY_GET, "version": 1,
+                           "entry_id": entry.entry_id, "zone_id": zone["id"], "tank_id": target["id"]}
+        reply = replies[request["id"]]
+        assert reply["success"], reply
+        result = reply["result"]
+        assert result["status"] == "ok" and not result["limited"], result
+        assert result["coverage"] == {"start_utc": samples[0], "end_utc": samples[2]}
+        exact = [{"at_utc": samples[2], "state": "off"}, {"at_utc": samples[1], "state": "on"}]
+        assert result["events"] == exact
+        assert await panel.locator("li time").evaluate_all("nodes => nodes.map(el => el.dateTime)") == [row["at_utc"] for row in exact]
+        await expect(panel.get_by_role("listitem").first).to_contain_text("關閉")
+        await expect(panel.get_by_role("listitem").last).to_contain_text("開啟")
+        await expect(panel.get_by_text("已驗證涵蓋：", exact=False)).to_contain_text("UTC")
+        if screenshot_dir:
+            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            await panel.screenshot(path=screenshot_dir / "native-alarm-history.png")
+        await pick.select_option(label="育苗區 · 一號水桶")
+        await expect(panel.locator("time")).to_have_count(0)
+        await panel.get_by_role("button", name="重新整理紀錄").click()
+        await expect(panel.get_by_text("未設定告警輸出", exact=True)).to_be_visible()
+        assert len(wire) == 2 and replies[wire[1]["id"]]["result"]["status"] == "no_binding"
+        assert entry.options is original_options and (store.read_bytes() if store.exists() else None) == store_before
+        assert not service_calls and outputs.calls.empty()
+        print("PASS: native alarm history WS, committed Recorder off/on/off ↔ two UTC rows, other tank no binding, zero service/config effects", flush=True)
+    finally:
+        unsub()
+    await shell.get_by_role("button", name="操作總覽", exact=True).click()
+
+
+async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path | None, login_only: bool, reference: Path | None,
+                      history_only: bool = False) -> None:
     async with async_playwright() as playwright:
         exe = os.environ.get("WATER_CHROMIUM_EXECUTABLE")
         browser = await playwright.chromium.launch(executable_path=exe, headless=True)
@@ -549,14 +590,30 @@ async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path 
             """)
             page = await context.new_page()
             calls: list[dict] = []
+            history_wire = []
+            history_replies = {}
 
             def record_frame(payload):
                 if isinstance(payload, str):
                     message = json.loads(payload)
                     if message.get("type") == "call_service":
                         calls.append(message)
+                    if message.get("type") == ALARM_HISTORY_GET:
+                        history_wire.append(message)
 
-            page.on("websocket", lambda ws: ws.on("framesent", record_frame))
+            def record_reply(payload):
+                messages = json.loads(payload)
+                ids = {request["id"] for request in history_wire}
+                for message in messages if isinstance(messages, list) else [messages]:
+                    if message.get("id") in ids and message.get("type") == "result":
+                        history_replies[message["id"]] = message
+
+            def watch_socket(socket):
+                socket.on("framesent", record_frame)
+                if history_only:
+                    socket.on("framereceived", record_reply)
+
+            page.on("websocket", watch_socket)
             page.on("pageerror", lambda error: errors.append(str(error)))
             await native_login(page, base_url)
             if login_only:
@@ -588,6 +645,10 @@ async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path 
             await expect(shell.get_by_text("1 區 · 5 桶 · 水位單位 m", exact=True)).to_be_visible()
             await expect(shell.get_by_role("meter")).to_have_count(0)
             await expect(readings.first).to_have_attribute("aria-label", "一號水桶 · 1.25 m")
+            if history_only:
+                await verify_alarm_history(hass, entry, shell, outputs, history_wire, history_replies, screenshot_dir)
+                assert not errors and not await page.evaluate("window.waterTestUncaught"), errors
+                return
             await readings.first.click(timeout=8000)
             details = page.locator("ha-more-info-dialog ha-dialog[open]")
             await details.wait_for(state="attached", timeout=10000)
@@ -617,27 +678,293 @@ async def run_browser(hass, entry, outputs, base_url: str, screenshot_dir: Path 
             options.set_default_timeout(8000)
             options.on("websocket", lambda ws: ws.on("framesent", record_frame))
             options.on("pageerror", lambda error: errors.append(str(error)))
-            for tab, heading, label in (
-                ("補水參數", "各桶門檻與顯示量程", "前往整合設定：門檻與量程"),
-                ("區域與水桶", "管理區域與水桶", "前往整合設定：區域與水桶"),
-            ):
-                await shell.get_by_role("button", name=tab, exact=True).click()
-                await expect(shell.get_by_role("heading", name=heading, exact=True)).to_be_visible()
-                settings = shell.get_by_role("link", name=label, exact=True)
-                async with context.expect_page() as opened:
-                    await settings.click(modifiers=["Control"])
-                target = await opened.value
-                await expect(target.get_by_role("button", name="Configure", exact=True)).to_be_visible()
-                await target.close()
+            await shell.get_by_role("button", name="補水參數", exact=True).click()
+            await expect(shell.get_by_role("heading", name="各桶門檻與顯示量程", exact=True)).to_be_visible()
+            await expect(shell.get_by_role("link")).to_have_count(0)
+            await shell.get_by_role("button", name="區域與水桶", exact=True).click()
+            await expect(shell.get_by_role("heading", name="區域與水桶清單", exact=True)).to_be_visible()
+            settings = shell.get_by_role("link", name="前往整合設定：區域與水桶", exact=True)
+            async with context.expect_page() as opened:
+                await settings.click(modifiers=["Control"])
+            target = await opened.value
+            await expect(target.get_by_role("button", name="Configure", exact=True)).to_be_visible()
+            await target.close()
             await shell.get_by_role("button", name="操作總覽").click()
             await verify_threshold_previews(page, options, shell, hass, entry, outputs, calls, base_url, screenshot_dir)
             scale_options = await context.new_page()
             scale_options.on("pageerror", lambda error: errors.append(str(error)))
-            await verify_browser_scale(scale_options, base_url, shell, screenshot_dir)
+            await verify_browser_scale(scale_options, base_url, shell, entry)
             assert not errors and not await page.evaluate("window.waterTestUncaught"), errors
             print(f"PASS: exact native resource, native More info and live inventory; en-US shell with Chinese card; grid {geometry}; external requests blocked={len(external_requests)}")
             if not login_only:
                 await verify_reference(browser, base_url, hass, entry, outputs, screenshot_dir, reference, restrict)
+
+
+async def open_card_editor(page, label):
+    """Use only the on-screen Edit button in the current live panel."""
+    modal = page.locator("hui-dialog-edit-card ha-dialog[open]")
+    deck = page.locator("hui-panel-view hui-card-options:visible")
+    await expect(modal).to_have_count(0)
+    # HA reuses the dialog host. A late native `closed`/popstate during a quick
+    # reopen can close the new editor; wait for that specific lifecycle to settle.
+    await page.wait_for_function("""() => !history.state?.dialog &&
+        performance.now() - (waterEditorDialogEvents.findLast(e => e[0] !== 'show')?.[2] ?? -1000) >= 300""")
+    action = deck.get_by_role("button", name=label, exact=True)
+    await expect(action).to_have_count(1)
+    await expect(action).to_be_visible()
+    # Activate the native control itself, not a text span (which can hit the
+    # closing mobile scrim while the retained dialog transitions out).
+    await action.press("Enter")
+    await expect(modal).to_have_count(1)
+    editor = modal.locator(f"{EDITOR_TAG}:visible")
+    await expect(editor.get_by_role("heading", name="補水參數", exact=True)).to_be_visible()
+    return modal, editor
+
+
+async def verify_native_editor(hass, entry, outputs, url, screenshots):
+    """Actual HA Lovelace UI and registered WS, separately count every writer."""
+    tank_id, _ = await native_commission(hass, entry)
+    synthetic = hass.states.get("sensor.test_depth_1")
+    store = Path(entry.runtime_data.settings.store.path)
+    asserted_asset = (ROOT / "custom_components" / DOMAIN / "dashboard.js").read_bytes()
+    if screenshots:
+        screenshots.mkdir(parents=True, exist_ok=True)
+
+    async def restrict(route):
+        if route.request.url.startswith(url + "/"):
+            await route.continue_()
+        else:
+            await route.abort()
+
+    async with async_playwright() as playwright, await playwright.chromium.launch(
+        executable_path=os.environ.get("WATER_CHROMIUM_EXECUTABLE"), headless=True
+    ) as browser:
+        widths = {}
+        for language, width, height, card_edit, cancel, save in (
+            ("en-US", 1180, 910, "Edit", "Cancel", "Save"),
+            ("zh-Hant", 390, 844, "編輯", "取消", "儲存"),
+        ):
+            async with await browser.new_context(locale=language, viewport={"width": width, "height": height}) as ctx:
+                await ctx.route("**/*", restrict)
+                page = await ctx.new_page()
+                page.set_default_timeout(8000)
+                await page.add_init_script("""
+                    window.waterEditorErrors = [];
+                    window.waterEditorEvents = 0;
+                    window.waterEditorDialogEvents = [];
+                    addEventListener('show-dialog', e => waterEditorDialogEvents.push(['show', e.detail?.dialogTag, performance.now()]), true);
+                    addEventListener('dialog-closed', e => waterEditorDialogEvents.push(['close', e.detail?.dialog, performance.now()]), true);
+                    addEventListener('popstate', e => waterEditorDialogEvents.push(['popstate', e.state?.dialog ?? null, performance.now()]), true);
+                    addEventListener('unhandledrejection', e => waterEditorErrors.push(e.reason?.code ?? String(e.reason)));
+                    addEventListener('config-changed', e => {
+                        if (e.composedPath().some(el => el.localName === 'uninus-water-dashboard-editor')) waterEditorEvents++;
+                    }, true);
+                """)
+                seen, errors = [], []
+
+                def record(raw):
+                    if isinstance(raw, str):
+                        message = json.loads(raw)
+                        if "id" in message:  # Never store the auth frame or anything with credentials.
+                            seen.append(message)
+
+                page.on("websocket", lambda ws: ws.on("framesent", record))
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                if language == "en-US":
+                    await native_login(page, url)
+                    await page.evaluate(SETTINGS_CALL, {"type": "lovelace/resources/create", "res_type": "module", "url": URL_PATH})
+                    await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config/save", "config": {"title": TITLE, "views": [
+                        {"title": TITLE, "path": "water-editor", "type": "panel", "cards": [{"type": f"custom:{CARD_TAG}"}]},
+                    ]}})
+
+                dashboard = url + "/lovelace/water-editor"
+                try:
+                    async with page.expect_response(url + URL_PATH) as asset:
+                        if language == "en-US":
+                            await page.goto(dashboard, wait_until="domcontentloaded")
+                        else:
+                            await native_login(page, dashboard)
+                    assert (await asset.value).ok and await (await asset.value).body() == asserted_asset
+                    await page.wait_for_function("lang => document.querySelector('home-assistant')?.hass?.locale?.language === lang",
+                                                 arg="en" if language == "en-US" else language)
+                    shell = page.locator(f"hui-panel-view {CARD_TAG}:visible")
+                    start = shell.get_by_role("button", name="手動補水", exact=True).first
+                    await expect(start).to_be_enabled()
+                    assert await shell.evaluate("card => [card.preview, card.editMode]") == [False, False]
+                    await expect(shell.locator("input,select")).to_have_count(0)
+                    await expect(shell.get_by_role("button", name="套用整合設定")).to_have_count(0)
+                    baseline = await read_settings(page, entry)
+                    disk_before = store.read_bytes() if store.exists() else None
+                    prior_options, runtime = entry.options, entry.runtime_data
+                    yaml_before = await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"})
+                    assert await page.evaluate("document.querySelector('home-assistant').hass.user.is_admin")
+                    seen.clear()
+
+                    def messages(kind):
+                        return [message for message in seen if message["type"] == kind]
+
+                    # Match the actual localized HA tooltip; its target is the Edit dashboard button.
+                    label = await page.evaluate("""() => document.querySelector('home-assistant').hass.localize(
+                        'ui.panel.lovelace.menu.configure_ui')""")
+                    tooltips = page.locator("hui-root ha-tooltip").filter(has_text=label)
+                    if label and await tooltips.count():
+                        ident = await tooltips.first.evaluate("el => el.for ?? el.getAttribute('for')")
+                        assert ident
+                        await page.locator(f"hui-root ha-icon-button#{ident}").click()
+                    else:
+                        await page.locator("#dashboardmenu").click()
+                        await page.get_by_text(label or ("Edit dashboard" if language == "en-US" else "編輯主面板"), exact=True).click()
+                    await expect(start).to_be_disabled()
+
+                    async def closed():
+                        await expect(page.locator("hui-dialog-edit-card ha-dialog[open]")).to_have_count(0)
+                        await page.wait_for_function("() => !history.state?.dialog")
+
+                    def scale_field(editor):
+                        return editor.locator(f'[data-tank-id="{tank_id}"]').get_by_role(
+                            "spinbutton", name="水位顯示量程上限（m）", exact=True
+                        )
+
+                    modal, editor = await open_card_editor(page, card_edit)
+                    preview = modal.locator(CARD_TAG)
+                    assert await preview.evaluate("card => [card.preview, card.editMode]") == [True, True]
+                    preview_start = preview.get_by_role("button", name="手動補水", exact=True).first
+                    await expect(preview_start).to_be_disabled()
+                    await preview_start.dispatch_event("click")
+                    await expect(preview.get_by_role("dialog")).to_have_count(0)
+                    scales = scale_field(editor)
+                    old = await scales.input_value()
+                    await scales.fill("")
+                    await scales.press_sequentially("7.")
+                    remembered = await scales.element_handle()
+                    await scales.evaluate("el => { el.dataset.blurs = 0; el.addEventListener('blur', () => el.dataset.blurs++); }")
+                    sample = "166" if language == "en-US" else "167"
+                    hass.states.async_set(synthetic.entity_id, sample, synthetic.attributes)
+                    await expect(preview.get_by_role("button", name=f"一號水桶 · {int(sample) / 100:.2f} m")).to_be_visible()
+                    await page.keyboard.type("125")
+                    await expect(scales).to_have_value("7.125")
+                    assert await scales.evaluate("(el, old) => el === old && el.getRootNode().activeElement === el && el.dataset.blurs === '0'", remembered)
+                    # The pinned HA wrapper may mark its unchanged value dirty on mount;
+                    # only events from our editor or actual WS writes are our boundary.
+                    assert await page.evaluate("waterEditorEvents") == 0
+                    assert not messages("lovelace/config/save") and not messages(f"{DOMAIN}/config_save")
+
+                    widths[language] = await editor.evaluate("""el => {
+                        const root = el.shadowRoot;
+                        const host = el.getBoundingClientRect();
+                        const visible = [...root.querySelectorAll('input,select,button')].filter(x => x.getClientRects().length);
+                        const grid = root.querySelector('.shared-grid');
+                        return {width:host.width, trackCount:getComputedStyle(grid).gridTemplateColumns.split(' ').length,
+                            noOverflow:visible.every(x => {
+                                const r=x.getBoundingClientRect(); return host.left <= r.left && r.right <= host.right;
+                            })};
+                    }""")
+                    assert widths[language]["noOverflow"]
+                    if screenshots:
+                        await page.screenshot(path=screenshots / f"native-editor-{language}.png")
+                    await modal.get_by_role("button", name=cancel, exact=True).click()
+                    await closed()
+                    assert not messages(f"{DOMAIN}/config_save")
+                    assert (store.read_bytes() if store.exists() else None) == disk_before
+                    assert await read_settings(page, entry) == baseline
+                    print(f"PASS {language}: trusted draft and state push, preview refused device action, native Cancel has zero writes")
+
+                    modal, editor = await open_card_editor(page, card_edit)
+                    await expect(scale_field(editor)).to_have_value(old)
+                    await scale_field(editor).fill("8.25")
+                    mode = modal.locator(".gui-mode-button")
+                    await mode.click()
+                    await expect(editor).to_have_count(0)
+                    assert not messages(f"{DOMAIN}/config_save")
+                    # Change an unrelated native layout field to prove what outer Save actually persists.
+                    yaml_field = modal.locator(".cm-content[contenteditable=true]")
+                    await yaml_field.click()
+                    columns = 6 if language == "en-US" else 7
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.insert_text(f"type: custom:{CARD_TAG}\ngrid_options:\n  columns: {columns}\n")
+                    await expect(modal.get_by_role("button", name=save, exact=True)).to_be_enabled()
+                    await mode.click()
+                    await expect(scale_field(editor)).to_have_value(old)
+                    await scale_field(editor).fill("8.5")
+                    await modal.get_by_role("button", name=save, exact=True).click()
+                    await closed()
+                    assert len(messages("lovelace/config/save")) == 1
+                    assert not messages(f"{DOMAIN}/config_save")
+                    assert (store.read_bytes() if store.exists() else None) == disk_before
+                    assert await read_settings(page, entry) == baseline
+                    yaml_saved = await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"})
+                    yaml_before["views"][0]["cards"][0]["grid_options"] = {"columns": columns}
+                    assert yaml_saved == yaml_before
+                    print(f"PASS {language}: YAML switch and native outer Save affect only Lovelace")
+
+                    second = await ctx.new_page()
+                    await second.goto(dashboard, wait_until="domcontentloaded")
+                    ordinary = second.locator(CARD_TAG)
+                    await expect(ordinary.get_by_role("heading", name="補水控制", exact=True)).to_be_visible()
+                    modal, editor = await open_card_editor(page, card_edit)
+                    await expect(scale_field(editor)).to_have_value(old)
+                    maximum = 2.75 if language == "en-US" else 3.25
+                    refill = editor.get_by_role("group", name="共用補水門檻", exact=True)
+                    alarm = editor.get_by_role("group", name="共用低液位告警", exact=True)
+                    await refill.get_by_role("spinbutton", name="下限（m）", exact=True).fill("0.45")
+                    await refill.get_by_role("spinbutton", name="上限（m）", exact=True).fill("1.55")
+                    await alarm.get_by_role("spinbutton", name="低位門檻（m）", exact=True).fill("0.3")
+                    await alarm.get_by_role("spinbutton", name="延遲（秒）", exact=True).fill("11")
+                    row = editor.locator(f'[data-tank-id="{tank_id}"]')
+                    await row.get_by_role("combobox", name="補水門檻模式").select_option("common")
+                    if language == "zh-Hant":
+                        await row.get_by_role("combobox", name="低液位告警模式").select_option("common")
+                    await scale_field(editor).fill(str(maximum))
+                    applied_meter = ordinary.get_by_role("meter", name=f"水位量程：0–{maximum} m")
+                    await expect(applied_meter).to_have_count(0)
+                    await editor.get_by_role("button", name="套用整合設定", exact=True).click()
+                    await expect(editor.get_by_text("已套用；不必再按外層儲存。", exact=True)).to_be_visible()
+                    await expect(applied_meter).to_be_visible()
+                    writes = messages(f"{DOMAIN}/config_save")
+                    assert len(writes) == 1 and len(messages("lovelace/config/save")) == 1
+                    [write] = writes
+                    assert (write["version"], write["entry_id"], write["if_revision"], write["if_source_snapshot"]) == (
+                        1, entry.entry_id, baseline["revision"], baseline["source_snapshot"],
+                    )
+                    assert any(request["id"] > write["id"] and request.get("entry_id") == entry.entry_id
+                               for request in messages(f"{DOMAIN}/config_get"))
+                    persisted = await read_settings(page, entry)
+                    tank = next(t for z in persisted["zones"] for t in z["tanks"] if t["id"] == tank_id)
+                    assert persisted["common"] == {"refill": [0.45, 1.55], "alarm": [0.3, 11]}
+                    assert tank["scale_max_m"] == maximum and tank["refill"]["use_common"]
+                    assert tank["alarm"]["use_common"] == (language == "zh-Hant")
+                    assert entry.options is prior_options and entry.runtime_data is runtime
+                    physical = store.read_bytes()
+                    assert physical != disk_before
+                    assert json.loads(physical)["data"]["common"] == persisted["common"]
+                    await modal.get_by_role("button", name=cancel, exact=True).click()
+                    await closed()
+                    assert await read_settings(page, entry) == persisted and store.read_bytes() == physical
+                    assert await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"}) == yaml_saved
+                    for card in (ordinary, shell):
+                        await expect(card.get_by_role("meter", name=f"水位量程：0–{maximum} m")).to_be_visible()
+                    modal, editor = await open_card_editor(page, card_edit)
+                    await expect(scale_field(editor)).to_have_value(str(maximum))
+                    await modal.get_by_role("button", name=cancel, exact=True).click()
+                    await closed()
+                    await page.locator("hui-root .exit-edit-mode").click()
+                    await expect(start).to_be_enabled()
+                    assert await shell.evaluate("card => [card.preview, card.editMode]") == [False, False]
+                    assert not messages("call_service") and outputs.calls.empty()
+                    assert len(messages(f"{DOMAIN}/config_save")) == 1
+                    assert not errors and not await page.evaluate("waterEditorErrors")
+                    assert await page.evaluate("waterEditorEvents") == 0
+                    print(f"PASS {language}: one Apply and independent readback; two ordinary cards updated; Cancel does not undo it")
+                except Exception:
+                    print(f"EDITOR DIAGNOSTIC {language}: {await page.locator('body').aria_snapshot()}")
+                    state = await page.evaluate("({history:history.state, path:location.pathname, events:waterEditorDialogEvents})")
+                    print(f"Editor native state: {state}")
+                    if screenshots:
+                        await page.screenshot(path=screenshots / f"native-editor-diagnostic-{language}.png")
+                    raise
+        assert widths["en-US"]["trackCount"] == 2 and widths["zh-Hant"]["trackCount"] == 1, widths
+        if screenshots:
+            (screenshots / "native-editor-geometry.json").write_text(json.dumps(widths, indent=2), encoding="utf-8")
 
 
 async def verify_reference(browser, base_url, hass, entry, outputs, screenshots, reference, restrict):
@@ -753,7 +1080,8 @@ MEASURE = """root => {
 }"""
 
 
-async def main(login_only: bool, screenshots: Path | None, reference: Path | None) -> None:
+async def main(login_only: bool, screenshots: Path | None, reference: Path | None, editor_only: bool = False,
+               history_only: bool = False) -> None:
     print(f"Core {importlib.metadata.version('homeassistant')}; frontend {importlib.metadata.version('home-assistant-frontend')}")
     with TemporaryDirectory(prefix="water-native-browser-") as temp:
         root = Path(temp)
@@ -777,32 +1105,53 @@ async def main(login_only: bool, screenshots: Path | None, reference: Path | Non
             assert owner.is_admin
             if not login_only:
                 outputs = SyntheticOutputs(hass)
+                if history_only:
+                    passive = er.async_get(hass).async_get_or_create(
+                        "switch", "browser_probe", "passive_history", suggested_object_id="browser_passive_history",
+                    )
+                    assert passive.entity_id == PASSIVE_ALARM
                 for i in range(1, 11):
                     hass.states.async_set(f"sensor.test_depth_{i}", str(110 + 15 * i), {"unit_of_measurement": "cm"})
                 entry = await native_entry(hass)
                 module = sys.modules[f"custom_components.{DOMAIN}"]
                 assert Path(module.__file__).resolve() == root / "custom_components" / DOMAIN / "__init__.py"
                 for pos in range(2, 6):
-                    await native_add_tank(hass, entry, pos)
+                    await native_add_tank(hass, entry, pos, PASSIVE_ALARM if pos == 2 and history_only else None)
             else:
                 entry = None
             await hass.async_start()
-            await run_browser(hass, entry, outputs, f"http://127.0.0.1:{port}", screenshots, login_only, reference)
+            url = f"http://127.0.0.1:{port}"
+            if editor_only:
+                await verify_native_editor(hass, entry, outputs, url, screenshots)
+            else:
+                await run_browser(hass, entry, outputs, url, screenshots, login_only, reference, history_only)
         finally:
             if outputs:
                 outputs.alarm_on.set()
             try:
                 await hass.async_stop()
+                assert not get_recorder(hass).is_alive()
             finally:
                 sys.path.remove(str(root))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--login-only", action="store_true", help="Check loopback HA frontend boot only")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--login-only", action="store_true", help="Check loopback HA frontend boot only")
+    mode.add_argument("--editor-only", action="store_true", help="Run only the native Lovelace editor acceptance")
+    mode.add_argument("--history-only", action="store_true", help="Run only the native Recorder alarm history acceptance")
     parser.add_argument("--screenshots", type=Path, help="Explicit destination for optional PNGs")
     parser.add_argument("--reference", type=Path, help="Frozen approved proposal HTML for matched measurements and captures")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING)
     logging.getLogger("aiohttp.access").disabled = True
-    asyncio.run(main(args.login_only, args.screenshots, args.reference))
+    asyncio.run(main(args.login_only, args.screenshots, args.reference, args.editor_only, args.history_only))
+    if not args.login_only and not args.editor_only and not args.history_only:
+        # Each branch gets virgin state and its own Core/runtime; Recorder
+        # fixtures for history cannot affect the existing operation/editor tests.
+        for mode in ("--editor-only", "--history-only"):
+            command = [sys.executable, "-u", str(Path(__file__).resolve()), mode]
+            if args.screenshots:
+                command += ["--screenshots", str(args.screenshots)]
+            subprocess.run(command, check=True, timeout=180)

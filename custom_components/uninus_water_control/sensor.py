@@ -12,11 +12,12 @@ from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, Home
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback, async_get_current_platform
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util.unit_conversion import DistanceConverter
 
-from .inventory import DISPLAY_SCALES, Tank, Zone, inventory, level_source
+from .inventory import DOMAIN, Tank, Zone, inventory, level_source
+from .settings import IDENT, PAIRS, _binding, matches
 
 LEVEL_UNITS = (UnitOfLength.METERS, UnitOfLength.CENTIMETERS, UnitOfLength.MILLIMETERS)
 _METRE_SHIFTS = {
@@ -28,6 +29,8 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     """Expose level and any configured read-only previews."""
+    platform = async_get_current_platform()
+    entry.runtime_data.settings.platforms[platform.domain] = platform
     async_add_entities(
         TankLevel(entry, zone, tank, zone_index, tank_index)
         for zone_index, zone in enumerate(inventory(entry))
@@ -35,10 +38,10 @@ async def async_setup_entry(
     )
     async_add_entities(ManualStatus(role) for role in entry.runtime_data.roles.values())
     async_add_entities(
-        RefillPreview(entry, zone, tank)
+        RefillPreview(entry, zone, effective)
         for zone in inventory(entry)
         for tank in zone["tanks"]
-        if "refill_lower_m" in tank.get("thresholds", {})
+        if "refill_lower_m" in (effective := entry.runtime_data.settings.with_thresholds(tank))["thresholds"]
     )
 
 
@@ -85,24 +88,15 @@ class TankLevel(SensorEntity):
         self._attr_unique_id = tank["id"]
         self._attr_translation_placeholders = {"zone": zone["name"], "tank": tank["name"]}
         self._attr_extra_state_attributes = {
+            "uninus_water_settings_entry": entry.entry_id,
             "uninus_water_dashboard": {
                 "version": 1,
                 "zone": {"id": zone["id"], "name": zone["name"], "index": zone_index},
                 "tank": {"id": tank["id"], "name": tank["name"], "index": tank_index},
             }
         }
-        display = {"version": 1}
-        thresholds = tank.get("thresholds", {})
-        for name, first, second in (
-            ("refill", "refill_lower_m", "refill_upper_m"),
-            ("alarm", "alarm_lower_m", "alarm_delay_seconds"),
-        ):
-            if first in thresholds and second in thresholds:
-                display[name] = (thresholds[first], thresholds[second])
-        if len(display) > 1:
-            self._attr_extra_state_attributes["uninus_water_display"] = display
-        self._refresh_display_scale()
         self._tank = tank
+        self._refresh_display()
         self._source: str | None = None
         self._unsub_source: CALLBACK_TYPE | None = None
 
@@ -118,28 +112,41 @@ class TankLevel(SensorEntity):
         self.async_on_remove(self._async_clear_source)
         self._async_refresh_source(level_source(er.async_get(self.hass), self._tank))
 
-    def _refresh_display_scale(self) -> bool:
-        """Change only the display maximum, without observing the source again."""
+    def _refresh_display(self) -> bool:
+        """Update only the public effective display fields."""
+        policy = self._entry.runtime_data.settings.tank_view(self._tank)
+        display = {"version": 1, **{kind: tuple(policy[kind]["effective"]) for kind in PAIRS
+                                   if policy[kind]["effective"] is not None}}
+        if policy["scale_max_m"] is not None:
+            display["scale_max_m"] = policy["scale_max_m"]
+        extra = self._attr_extra_state_attributes
         key = "uninus_water_display"
-        old = self._attr_extra_state_attributes.get(key, {"version": 1})
-        value = self._entry.data.get(DISPLAY_SCALES, {}).get(self._attr_unique_id)
-        if value == old.get("scale_max_m"):
-            return False
-        display = dict(old)
-        if value is None:
-            display.pop("scale_max_m", None)
-        else:
-            display["scale_max_m"] = value
+        old = extra.get(key)
         if len(display) > 1:
-            self._attr_extra_state_attributes[key] = display
+            extra[key] = display
         else:
-            self._attr_extra_state_attributes.pop(key, None)
-        return True
+            extra.pop(key, None)
+        return old != extra.get(key)
+
+    @callback
+    def async_apply_topology(self, zone, tank, zone_index, tank_index):
+        before = self._attr_extra_state_attributes["uninus_water_dashboard"]
+        after = {"version": 1, "zone": {"id": zone["id"], "name": zone["name"], "index": zone_index},
+                 "tank": {"id": tank["id"], "name": tank["name"], "index": tank_index}}
+        source_changed = _binding(self._tank, "level_sensor") != _binding(tank, "level_sensor")
+        self._tank = tank
+        if before != after:
+            self._attr_extra_state_attributes["uninus_water_dashboard"] = after
+        if source_changed:
+            self._async_refresh_source(level_source(er.async_get(self.hass), tank))
+        display_changed = self._refresh_display()
+        if before != after or source_changed or display_changed:
+            self.async_write_ha_state()
 
     @callback
     def _async_entry_changed(self, change: ConfigEntryChange, entry: ConfigEntry) -> None:
         if (change is ConfigEntryChange.UPDATED and entry is self._entry
-                and entry.state is ConfigEntryState.LOADED and self._refresh_display_scale()):
+                and entry.state is ConfigEntryState.LOADED and self._refresh_display()):
             self.async_write_ha_state()
 
     @callback
@@ -304,6 +311,22 @@ class ThresholdEntity(Entity):
         if self._live:
             self.async_write_ha_state()
 
+    @callback
+    def async_policy_changed(self, tank: Tank) -> None:
+        if (self._threshold_values(self._tank) == self._threshold_values(tank)
+                and _binding(self._tank, "level_sensor") == _binding(tank, "level_sensor")):
+            return
+        self._tank = tank
+        self._configure_thresholds(tank)
+        self._async_rebind(self._resolve_source())
+        self._async_queue_publish()
+
+    def _threshold_values(self, tank: Tank) -> tuple:
+        return tuple(tank["thresholds"][key] for key in self._policy_keys)
+
+    def _configure_thresholds(self, tank):
+        raise NotImplementedError
+
     def _observe(self, level: Decimal | None) -> None:
         raise NotImplementedError
 
@@ -314,9 +337,13 @@ class RefillPreview(ThresholdEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["refill_threshold", "between_thresholds", "stop_threshold"]
     _attr_native_value = None
+    _policy_keys = PAIRS["refill"]
 
     def __init__(self, entry: ConfigEntry, zone: Zone, tank: Tank) -> None:
         super().__init__(entry, zone, tank, "refill_preview")
+        self._configure_thresholds(tank)
+
+    def _configure_thresholds(self, tank):
         self._lower = Decimal(str(tank["thresholds"]["refill_lower_m"]))
         self._upper = Decimal(str(tank["thresholds"]["refill_upper_m"]))
 
@@ -330,3 +357,51 @@ class RefillPreview(ThresholdEntity, SensorEntity):
             self._attr_native_value = "stop_threshold"
         else:
             self._attr_native_value = "between_thresholds"
+
+
+async def async_reconcile_settings(hass, entry, settings):
+    """Refresh only this entry's projections; do not reload platform owners."""
+    from .binary_sensor import LowLevelAlarm
+
+    wanted = {"sensor": {}, "binary_sensor": {}}
+    levels = {}
+    for zi, zone in enumerate(inventory(entry)):
+        for ti, tank in enumerate(zone["tanks"]):
+            levels[tank["id"]] = (zone, tank, zi, ti)
+            effective = settings.with_thresholds(tank)
+            for domain, kind, cls, suffix in (
+                ("sensor", "refill", RefillPreview, "refill_preview"),
+                ("binary_sensor", "alarm", LowLevelAlarm, "low_level_alarm"),
+            ):
+                if PAIRS[kind][0] in effective["thresholds"]:
+                    wanted[domain][f"{tank['id']}_{suffix}"] = (cls, zone, effective)
+    registry = er.async_get(hass)
+    for platform in settings.platforms.values():
+        upcoming = wanted[platform.domain]
+        suffix = "_refill_preview" if platform.domain == "sensor" else "_low_level_alarm"
+        for row in er.async_entries_for_config_entry(registry, entry.entry_id):
+            if row.platform != DOMAIN or row.domain != platform.domain:
+                continue
+            obsolete_preview = row.unique_id.endswith(suffix) and row.unique_id not in upcoming
+            obsolete_level = platform.domain == "sensor" and matches(IDENT, row.unique_id) and row.unique_id not in levels
+            if obsolete_preview or obsolete_level:
+                if row.entity_id in platform.entities:
+                    await platform.async_remove_entity(row.entity_id)
+                registry.async_remove(row.entity_id)
+        additions = []
+        if platform.domain == "sensor":
+            for ident, args in levels.items():
+                entity_id = registry.async_get_entity_id("sensor", DOMAIN, ident)
+                if isinstance(entity := platform.entities.get(entity_id), TankLevel):
+                    entity.async_apply_topology(*args)
+                elif entity_id is None or not registry.async_get(entity_id).disabled_by:
+                    additions.append(TankLevel(entry, *args))
+        for ident, (cls, zone, tank) in upcoming.items():
+            entity_id = registry.async_get_entity_id(platform.domain, DOMAIN, ident)
+            entity = platform.entities.get(entity_id)
+            if isinstance(entity, ThresholdEntity):
+                entity.async_policy_changed(tank)
+            elif entity_id is None or not registry.async_get(entity_id).disabled_by:
+                additions.append(cls(entry, zone, tank))
+        if additions:
+            await platform.async_add_entities(additions)

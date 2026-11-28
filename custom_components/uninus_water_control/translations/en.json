@@ -34,9 +34,23 @@
         "menu_options": {
           "add_zone": "Add zone", "edit_zone": "Rename zone", "remove_zone": "Remove zone",
           "add_tank": "Add tank", "edit_tank": "Edit tank", "remove_tank": "Remove tank",
-          "edit_display_scale": "Edit water-level display scale",
-          "edit_thresholds": "Edit threshold previews"
+          "card_settings": "Thresholds and display scale: dashboard card editor",
+          "enroll_topology": "Transfer topology to the integration store",
+          "topology_status": "Topology transfer status"
         }
+      },
+      "topology_not_requested": {
+        "title": "Topology transfer not requested",
+        "description": "This controller still uses its original configuration. Before updating from the older integration, keep a verified Home Assistant settings backup from before the update. Keep the independent device cutoff engaged during any transfer."
+      },
+      "topology_owned_active": {
+        "title": "Topology transfer complete",
+        "description": "The integration is loaded and its saved topology has been verified. In Settings → System → Backups, create and download a matching Home Assistant settings backup now. This status does not verify physical equipment or prove that it is off."
+      },
+      "enroll_topology": {
+        "title": "Prepare a topology transfer",
+        "description": "Make a verified Home Assistant backup and reserve a maintenance window for two full Core restarts. Keep the device-side cutoff engaged. This request is not confirmation that migration completed or that the equipment is physically off.",
+        "data": {"confirm_device_cutoff": "I have a verified backup and independently confirmed the cutoff and safe physical state"}
       },
       "add_zone": {
         "title": "Add a zone and its first tank",
@@ -71,21 +85,6 @@
           "confirm_device_cutoff": "Verify the physical mapping and ensure no other controller uses the same output. Each enabled device must fail OFF independently of Home Assistant and the network. This checkbox does not test hardware. Leave both roles disabled if you cannot verify these conditions."
         }
       },
-      "save_display_scale": {
-        "title": "Water-level display scale",
-        "description": "Set the top of the display scale for {target}, measured from zero. Leave blank to remove the scale. This is not a volume, threshold or control setting.",
-        "data": {"scale_max_m": "Display scale maximum"}
-      },
-      "save_thresholds": {
-        "title": "Read-only threshold previews",
-        "description": "Selection: {target}. Fill in both fields of each feature you want to use, or leave both blank to turn that feature off. These previews never operate switches or send notifications.",
-        "data": {
-          "refill_lower_m": "Refill lower threshold",
-          "refill_upper_m": "Stop upper threshold",
-          "alarm_lower_m": "Low-level alarm threshold",
-          "alarm_delay_seconds": "Continuous low-level alarm delay"
-        }
-      },
       "confirm_remove": {
         "title": "Confirm removal",
         "description": "Remove {target}? Removing a zone also removes all its tanks from this integration. Source sensors and switches are not changed.",
@@ -106,20 +105,26 @@
       "shared_output": "This output or device is referenced by another role. Verify and resolve the shared mapping first.",
       "output_source_changed": "The switch at this entity ID changed. Reopen the form and explicitly select the intended switch.",
       "whole_seconds_required": "Enter a whole number of seconds.",
-      "finite_threshold_required": "Enter a finite number.",
-      "threshold_pair_required": "Enter both fields for this feature, or clear both to disable it.",
-      "threshold_order": "The stop threshold must be higher than the refill threshold.",
-      "positive_display_scale": "Enter a finite number greater than zero, or leave blank.",
-      "positive_whole_delay": "Enter a whole number of seconds, at least 1.",
       "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again."
     },
     "abort": {
+      "card_settings_in_dashboard_editor": "Open the dashboard, enter Edit dashboard, then edit the Water Control card. Use Apply integration settings in the visual card editor.",
+      "entry_not_loaded": "The controller is not loaded. Reopen Configure after it is loaded.",
+      "topology_admin_required": "An active administrator must reopen this form.",
+      "topology_writer_unavailable": "The integration settings are unavailable for editing. Check the controller status and the topology recovery instructions.",
+      "topology_restart_required": "Topology transfer is not complete. Keep the independent device cutoff engaged. Restart Home Assistant Core completely (do not reload the integration), then reopen Configure to check the status again. If recovery is required, follow the backup instructions instead.",
+      "topology_recovery_required": "Topology recovery required. Use the independent device cutoff and verify the physical state; do not use Home Assistant to guess which output to switch. An administrator must restore the matching Home Assistant settings backup as a whole from Settings → System → Backups. Restore can replace other Home Assistant settings. Do not mix backups or copy individual storage files.",
+      "readback_required": "The write could not be confirmed and the old settings will not be reapplied. Keep the device-side cutoff engaged and check the controller status before trying again.",
       "configuration_changed": "The configuration changed while this form was open. Open Configure again and retry.",
       "manual_outputs_unsettled": "Stop manual controls and wait for OFF feedback and any outstanding commands before editing.",
       "invalid_target": "The selected zone or tank does not exist.",
       "minimum_zones": "The controller must contain at least one zone.",
       "minimum_tanks": "Each zone must contain at least one tank. To remove the whole zone, use Remove zone."
     }
+  },
+  "exceptions": {
+    "topology_restart_required": {"message": "Topology transfer requires another full Home Assistant restart. Keep the device-side cutoff engaged."},
+    "topology_recovery_required": {"message": "Topology recovery required. Use the independent device cutoff and verify the physical state. An administrator must restore the matching Home Assistant settings backup as a whole in Settings → System → Backups; restore can replace other settings. Do not mix backup snapshots."}
   },
   "entity": {
     "sensor": {

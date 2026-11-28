@@ -62,6 +62,15 @@ def level_source(registry: EntityRegistry, tank: Tank) -> str | None:
     return None if registry.async_is_registered(entity_id) else entity_id
 
 
-def inventory(entry: ConfigEntry) -> list[Zone]:
-    """Read the effective inventory: native options replace the initial seed."""
+def legacy_inventory(entry: ConfigEntry) -> list[Zone]:
     return entry.options["zones"] if "zones" in entry.options else entry.data["zones"]
+
+
+def inventory(entry: ConfigEntry) -> list[Zone]:
+    """Never use Core's retained migration seed as owned topology."""
+    from .topology_lifecycle import MARK, witness
+
+    if MARK not in entry.data:
+        return legacy_inventory(entry)
+    owner = getattr(entry, "runtime_data", None)
+    return owner.zones if owner and owner.enrollment == witness(entry) else []

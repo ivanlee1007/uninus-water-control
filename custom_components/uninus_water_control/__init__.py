@@ -5,16 +5,23 @@ from pathlib import Path
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import entity_registry as er
 
+from . import alarm_history
+from .config_api import register
 from .inventory import DOMAIN, inventory
 from .manual import ACTIONS, ROLES, ManualController
+from .settings import Settings, SettingsError
+from .topology_lifecycle import MARK, VERSION
 
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Expose the single public module when Core has an HTTP server."""
+    register(hass)
+    alarm_history.register(hass)
     if hass.http is not None:
         from aiohttp import web
         from homeassistant.helpers.http import HomeAssistantView
@@ -35,13 +42,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 
 @callback
-def _async_prune_levels(hass: HomeAssistant, entry: ConfigEntry) -> None:
+def _async_prune_levels(hass: HomeAssistant, entry: ConfigEntry, settings: Settings | None = None) -> None:
     """Remove only our registry records for projections no longer configured."""
-    tanks = [tank for zone in inventory(entry) for tank in zone["tanks"]]
+    if MARK in entry.data and (settings is None or settings.topology is None or settings.topology_busy):
+        # Pending and recovery states retain registry identity for restoration.
+        return
+    tanks = [tank for zone in (settings.zones if settings else inventory(entry)) for tank in zone["tanks"]]
     active_ids = {tank["id"] for tank in tanks}
-    previews = {f"{tank['id']}_refill_preview" for tank in tanks if "refill_lower_m" in tank.get("thresholds", {})}
-    alarms = {f"{tank['id']}_low_level_alarm" for tank in tanks if "alarm_lower_m" in tank.get("thresholds", {})}
-    manual = entry.options.get("manual") or {}
+    # Without an active settings owner, only remove rows for retired tanks.
+    projected = [settings.with_thresholds(t) if settings else t for t in tanks]
+    previews = {f"{t['id']}_refill_preview" for t in projected if settings is None or t["thresholds"].get("refill_lower_m") is not None}
+    alarms = {f"{t['id']}_low_level_alarm" for t in projected if settings is None or t["thresholds"].get("alarm_lower_m") is not None}
+    manual = settings.manual if settings else entry.options.get("manual") or {}
     tank_id = manual.get("tank_id")
     roles = [role for role in ROLES if tank_id in active_ids and manual.get(role)]
     buttons = {f"{tank_id}_{role}_{action}" for role in roles for action in ACTIONS}
@@ -63,27 +75,47 @@ def async_prune_disabled_levels(hass: HomeAssistant, entry: ConfigEntry) -> None
         _async_prune_levels(hass, entry)
 
 
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Introduce the lifecycle schema without implicitly enrolling old entries."""
+    if entry.version == 1 and MARK not in entry.data:
+        hass.config_entries.async_update_entry(entry, version=VERSION)
+        return True
+    return False
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Reconcile the registry and load the current sensors."""
-    _async_prune_levels(hass, entry)
-    entry.runtime_data = ManualController(hass, entry)
+    settings = Settings(hass, entry)
+    try:
+        await settings.async_initialize()
+    except SettingsError as err:
+        restart = str(err) == "topology_restart_required"
+        message = ("Water topology handoff awaits a fresh Home Assistant process. Keep the independent cutoff in effect."
+                   if restart else "Water topology recovery required. Output identity and physical state are unverified. "
+                   "Use the independent device cutoff; restore the matching backup before restarting.")
+        raise ConfigEntryError(message, translation_domain=DOMAIN, translation_key=str(err)) from None
+    _async_prune_levels(hass, entry, settings)
+    entry.runtime_data = ManualController(hass, entry, settings)
     platforms = [*PLATFORMS, Platform.BUTTON] if entry.runtime_data.roles else PLATFORMS
     await hass.config_entries.async_forward_entry_setups(entry, platforms)
+    alarm_history.attach(hass, entry, entry.runtime_data)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload the sensors and their source listeners before pruning stale rows."""
     runtime = entry.runtime_data
+    alarm_history.detach(hass, runtime)
     if not await runtime.async_close():
         # Core has already entered UNLOAD_IN_PROGRESS and a false result is
         # terminal (FAILED_UNLOAD). Keep the old owner for late OFF cleanup.
         runtime.require_restart()
         return False
-    platforms = [*PLATFORMS, Platform.BUTTON] if runtime.roles else PLATFORMS
-    if not await hass.config_entries.async_unload_platforms(entry, platforms):
-        runtime.require_restart()
-        return False
-    runtime.detach()
-    _async_prune_levels(hass, entry)
+    async with runtime.settings.lock:
+        platforms = [*PLATFORMS, Platform.BUTTON] if runtime.roles else PLATFORMS
+        if not await hass.config_entries.async_unload_platforms(entry, platforms):
+            runtime.require_restart()
+            return False
+        runtime.detach()
+        _async_prune_levels(hass, entry, runtime.settings)
     return True

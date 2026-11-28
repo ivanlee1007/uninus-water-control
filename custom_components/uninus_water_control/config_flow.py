@@ -2,34 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
-from math import isfinite
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
+from homeassistant.components.http.const import KEY_HASS_USER
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.http import current_request
 from homeassistant.helpers.selector import BooleanSelector, EntitySelector, NumberSelector, SelectSelector, TextSelector
 
 from . import async_prune_disabled_levels
-from .inventory import DISPLAY_SCALES, DOMAIN, TITLE, Zone, inventory, level_source, new_tank, new_zone
+from .inventory import DOMAIN, TITLE, Zone, inventory, level_source, new_tank, new_zone
 from .manual import DEFAULT_SECONDS, ROLES, output_conflicts, output_row, source_conflicts
+from .settings import SettingsError
+from .topology_lifecycle import MARK, VERSION as TOPOLOGY_VERSION, enrollment_fence, request_enrollment, valid_witness, witness
 
 LEVEL_SENSOR = "level_sensor"
 ENTITY_FIELDS = {LEVEL_SENSOR: "sensor", "refill_switch": "switch", "alarm_switch": "switch"}
-
-
-class _ThresholdNumberSelector(NumberSelector):
-    """Expose the native numeric box without accepting boolean coercion."""
-
-    def __call__(self, data: object) -> float:
-        if isinstance(data, bool):
-            raise vol.Invalid("Expected a number")
-        try:
-            return super().__call__(data)
-        except OverflowError as err:
-            raise vol.Invalid("Number is out of range") from err
 
 
 def _text_field(field: str, values: dict) -> dict:
@@ -102,6 +94,8 @@ class _LevelSuggestions:
 class WaterControlConfigFlow(ConfigFlow, domain=DOMAIN):
     """Create the controller with its first zone and tank."""
 
+    VERSION = TOPOLOGY_VERSION
+
     def __init__(self) -> None:
         self._level_suggestions = _LevelSuggestions()
 
@@ -144,17 +138,89 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         """Take a draft snapshot and show available operations."""
         if self._entry is None:
             self._entry = entry = self.config_entry
+            if MARK in entry.data:
+                self._actor = self._native_actor()
+                if (reason := self._enrollment_block(entry)) is not None:
+                    return self.async_abort(reason=reason)
+            self._require_writer(entry)
             self._base_options = entry.options
             self._base_data = entry.data
+            self._base_owner = getattr(entry, "runtime_data", None)
+            settings = getattr(self._base_owner, "settings", None)
+            self._owned = MARK in entry.data
+            self._base_manual = settings.manual if self._owned else self._base_options.get("manual") or {}
+            self._base_settings_generation = settings.generation if settings else None
             self._zones = deepcopy(inventory(entry))
         self._require_fresh()
+        operations = ["edit_tank", "card_settings"] if self._owned else [
+            "add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank", "card_settings",
+        ]
+        if not self._owned and self._entry.state is ConfigEntryState.LOADED:
+            operations.append("enroll_topology")
+        operations.append("topology_status")
         return self.async_show_menu(
             step_id="init",
-            menu_options=[
-                "add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank", "edit_thresholds",
-                "edit_display_scale",
-            ],
+            menu_options=operations,
         )
+
+    def _enrollment_block(self, entry: ConfigEntry) -> str | None:
+        mark = witness(entry)
+        if not valid_witness(mark) or entry.error_reason_translation_key == "topology_recovery_required":
+            return "topology_recovery_required"
+        if reason := enrollment_fence(self.hass, entry):
+            return reason
+        if mark["phase"] == "requested":
+            return "topology_restart_required"
+        if entry.state is not ConfigEntryState.LOADED or getattr(entry, "runtime_data", None) is None:
+            return "entry_not_loaded"
+        if entry.runtime_data.settings.topology_busy:
+            return "topology_writer_unavailable"
+        return None
+
+    async def async_step_topology_status(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Show only lifecycle status, not settings or actuator state."""
+        entry = self._require_fresh()
+        step = "topology_not_requested"
+        if self._owned:
+            try:
+                verified = await entry.runtime_data.settings.async_confirm_owned()
+            except SettingsError as err:
+                return self.async_abort(reason="entry_not_loaded" if str(err) == "entry_not_loaded"
+                                        else "topology_writer_unavailable")
+            # A failed disk confirmation has already withdrawn writer access.
+            # Recheck the flow's owner and actor before reporting that verdict.
+            self._require_fresh(require_writer=verified)
+            if not verified:
+                return self.async_abort(reason="topology_recovery_required")
+            step = "topology_owned_active"
+        return self.async_show_form(step_id=step, data_schema=vol.Schema({}), last_step=False)
+
+    async def async_step_topology_not_requested(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return await self.async_step_init()
+
+    async def async_step_topology_owned_active(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return await self.async_step_init()
+
+    async def async_step_enroll_topology(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Arm an explicit, cutoff-confirmed handoff without writing topology."""
+        entry = self._require_fresh()
+        if self._owned:
+            return self.async_abort(reason="topology_writer_unavailable")
+        runtime = getattr(entry, "runtime_data", None)
+        if entry.state is not ConfigEntryState.LOADED or runtime is None:
+            return self.async_abort(reason="entry_not_loaded")
+        if user_input and user_input.get("confirm_device_cutoff") is True:
+            if runtime.settings.lock.locked():
+                return self.async_abort(reason="configuration_changed")
+            self._require_settled(entry)
+            request_enrollment(self.hass, entry)
+            # The already-loaded exact owner can still Stop, but never Start.
+            for role in runtime.roles.values():
+                role._publish()
+            return self.async_create_entry(data=None)
+        return self.async_show_form(step_id="enroll_topology", data_schema=vol.Schema({
+            vol.Required("confirm_device_cutoff", default=False): BooleanSelector(),
+        }), errors={"confirm_device_cutoff": "cutoff_required"} if user_input is not None else {})
 
     async def async_step_add_zone(self, user_input: dict | None = None) -> ConfigFlowResult:
         self._operation = "add_zone"
@@ -175,21 +241,55 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
     async def async_step_remove_tank(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self._choose("remove_tank")
 
-    async def async_step_edit_thresholds(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("edit_thresholds")
+    async def async_step_card_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
+        """Direct users to the single owner without presenting a second form."""
+        return self.async_abort(reason="card_settings_in_dashboard_editor")
 
-    async def async_step_edit_display_scale(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("edit_display_scale")
-
-    def _require_fresh(self) -> ConfigEntry:
+    def _require_fresh(self, *, require_writer: bool = True) -> ConfigEntry:
         entry = self.hass.config_entries.async_get_entry(self.handler)
+        if require_writer and entry is not None:
+            self._require_writer(entry)
         if (
             entry is not self._entry
             or entry is None
             or (entry.options is not self._base_options or entry.data is not self._base_data)
+            or (self._owned and getattr(entry, "runtime_data", None) is not self._base_owner)
         ):
             raise AbortFlow("configuration_changed")
+        if self._owned and self._native_actor() is not self._actor:
+            raise AbortFlow("topology_admin_required")
+        settings = getattr(getattr(entry, "runtime_data", None), "settings", None)
+        if (settings.generation if settings else None) != self._base_settings_generation:
+            raise AbortFlow("configuration_changed")
         return entry
+
+    @staticmethod
+    def _require_writer(entry: ConfigEntry) -> None:
+        owner = getattr(entry, "runtime_data", None)
+        if MARK in entry.data:
+            if owner is None or owner.settings.topology is None:
+                raise AbortFlow("topology_writer_unavailable")
+            try:
+                owner.settings.require_live()
+            except SettingsError as err:
+                raise AbortFlow("topology_writer_unavailable") from err
+            return
+        # Preserve intentional edits to a user-disabled, never-enrolled entry;
+        # a transient unload or pending/owned handoff is not that workflow.
+        if entry.state is ConfigEntryState.NOT_LOADED and entry.disabled_by:
+            return
+        if entry.state is not ConfigEntryState.LOADED or owner is None or owner.retiring:
+            raise AbortFlow("entry_not_loaded")
+
+    @staticmethod
+    def _native_actor():
+        request = current_request.get()
+        if request is None:
+            return None  # Trusted in-process native manager, not an HTTP request.
+        actor = request.get(KEY_HASS_USER)
+        if actor is None or not actor.is_active or not actor.is_admin or actor.system_generated:
+            raise AbortFlow("topology_admin_required")
+        return actor
 
     @staticmethod
     def _require_settled(entry: ConfigEntry) -> None:
@@ -201,16 +301,52 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         # Core's OptionsFlowManager updates the options synchronously on this
         # return path; do not put an await between this check and that update.
         entry = self._require_fresh()
+        if self._owned:
+            raise AbortFlow("topology_writer_unavailable")
+        settings = getattr(getattr(entry, "runtime_data", None), "settings", None)
+        if settings and settings.lock.locked():
+            raise AbortFlow("configuration_changed")
         self._require_settled(entry)
         if (manual := self._base_options.get("manual")) and not any(
             tank["id"] == manual["tank_id"] for zone in self._zones for tank in zone["tanks"]
         ):
             self._manual_delta = {"manual": {}}
-        if entry.disabled_by and self._operation in ("remove_zone", "remove_tank", "edit_thresholds"):
+        if entry.disabled_by and self._operation in ("remove_zone", "remove_tank"):
             # Disabled entries do not set up on reload. Read only the committed
             # native options on the next loop turn, never this private draft.
             self.hass.loop.call_soon(async_prune_disabled_levels, self.hass, entry)
         return self.async_create_entry(data={**self._base_options, "zones": self._zones} | self._manual_delta)
+
+    async def _commit_owned_tank(self) -> ConfigFlowResult:
+        entry = self._require_fresh()
+        if self._operation != "edit_tank":
+            raise AbortFlow("topology_writer_unavailable")
+        self._require_settled(entry)
+        settings = entry.runtime_data.settings
+        source = settings.source_snapshot(self._zones)
+        manual = self._manual_delta.get("manual", self._base_manual)
+
+        async def authorize():
+            actor = self._native_actor()
+            if actor is not None:
+                current = await self.hass.auth.async_get_user(actor.id)
+                if current is not actor or self._native_actor() is not self._actor:
+                    raise AbortFlow("topology_admin_required")
+
+        def admitted():
+            self._require_fresh()
+            self._require_settled(entry)
+            if settings.source_snapshot(self._zones) != source:
+                raise AbortFlow("configuration_changed")
+
+        try:
+            await asyncio.shield(self.hass.async_create_task(settings.async_edit_topology(
+                self._zones, manual, self._base_settings_generation, authorize, admitted), "water protected tank edit"))
+        except SettingsError as err:
+            reason = str(err)
+            raise AbortFlow(reason if reason in ("configuration_changed", "entry_not_loaded", "readback_required")
+                            else "topology_writer_unavailable") from err
+        return self.async_create_entry(data=None)
 
     def _choose(self, operation: str) -> ConfigFlowResult:
         self._operation = operation
@@ -221,7 +357,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
 
     def _target_form(self, user_input: dict | None) -> ConfigFlowResult:
         self._require_fresh()
-        tank_target = self._operation in ("edit_tank", "remove_tank", "edit_thresholds", "edit_display_scale")
+        tank_target = self._operation in ("edit_tank", "remove_tank")
         field = "tank_id" if tank_target else "zone_id"
         targets = {}
         registry = er.async_get(self.hass)
@@ -248,11 +384,9 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         if self._operation == "edit_zone":
             return self._zone_form("rename_zone", None)
         if self._operation in ("add_tank", "edit_tank"):
-            return self._tank_form(None)
-        if self._operation == "edit_thresholds":
-            return self._threshold_form(None)
-        if self._operation == "edit_display_scale":
-            return self._display_scale_form(None)
+            result = self._tank_form(None)
+            assert result is not None
+            return result
         if self._operation == "remove_zone" and len(self._zones) == 1:
             return self.async_abort(reason="minimum_zones")
         if self._operation == "remove_tank" and len(self._zone["tanks"]) == 1:
@@ -288,9 +422,12 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         return self.async_show_form(step_id=step_id, data_schema=vol.Schema(fields), errors=errors)
 
     async def async_step_save_tank(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._tank_form(user_input)
+        result = self._tank_form(user_input)
+        if result is not None:
+            return result
+        return await self._commit_owned_tank() if self._owned else self._commit()
 
-    def _tank_form(self, user_input: dict | None) -> ConfigFlowResult:
+    def _tank_form(self, user_input: dict | None) -> ConfigFlowResult | None:
         self._require_fresh()
         index = self._tank_index
         tank = self._zone["tanks"][index] if index is not None else None
@@ -305,7 +442,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
                     row = registry.async_get(row_id)
                     defaults[field] = row.entity_id if row else None
         values, errors = self._level_suggestions.form_input(self.hass, user_input, defaults)
-        manual = self._base_options.get("manual") or {}
+        manual = self._base_manual
         if tank is not None and user_input is not None and not errors:
             self._manual_delta, errors = self._commission(registry, tank, user_input, manual)
         if user_input is not None and not errors:
@@ -316,7 +453,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
                 if "thresholds" in tank:
                     edited["thresholds"] = tank["thresholds"]
                 self._zone["tanks"][index] = edited
-            return self._commit()
+            return None
         # Any rejected submission, including cutoff confirmation, can echo a
         # newly selected entity. Capture identities only once rendering is known.
         self._level_suggestions.capture(registry, values)
@@ -391,84 +528,6 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
                 "max_runtime_seconds": int(seconds),
             }
         return {"manual": settings}, {}
-
-    async def async_step_save_thresholds(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._threshold_form(user_input)
-
-    def _threshold_form(self, user_input: dict | None) -> ConfigFlowResult:
-        self._require_fresh()
-        assert self._tank_index is not None
-        tank = self._zone["tanks"][self._tank_index]
-        lower, upper = "refill_lower_m", "refill_upper_m"
-        alarm, delay = "alarm_lower_m", "alarm_delay_seconds"
-        values = tank.get("thresholds", {}) if user_input is None else user_input
-        errors = {field: "finite_threshold_required" for field, value in values.items() if not isfinite(value)}
-        for first, second in ((lower, upper), (alarm, delay)):
-            if (first in values) != (second in values):
-                errors[second if first in values else first] = "threshold_pair_required"
-        if (
-            lower in values and upper in values and lower not in errors and upper not in errors
-            and values[lower] >= values[upper]
-        ):
-            errors[upper] = "threshold_order"
-        if delay in values and delay not in errors and (values[delay] < 1 or not float(values[delay]).is_integer()):
-            errors[delay] = "positive_whole_delay"
-        if user_input is not None and not errors:
-            if values:
-                tank["thresholds"] = dict(values)
-            else:
-                tank.pop("thresholds", None)
-            return self._commit()
-        fields = {}
-        for field, step, unit in ((lower, "any", "m"), (upper, "any", "m"), (alarm, "any", "m"), (delay, 1, "s")):
-            value = values.get(field)
-            suggestion = value if value is not None and isfinite(value) else None
-            fields[vol.Optional(field, description={"suggested_value": suggestion})] = _ThresholdNumberSelector(
-                {"step": step, "mode": "box", "unit_of_measurement": unit}
-            )
-        return self.async_show_form(
-            step_id="save_thresholds", data_schema=vol.Schema(fields), errors=errors,
-            description_placeholders={"target": self._target_label},
-        )
-
-    async def async_step_save_display_scale(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._display_scale_form(user_input)
-
-    def _display_scale_form(self, user_input: dict | None) -> ConfigFlowResult:
-        entry = self._require_fresh()
-        assert self._tank_index is not None
-        tank_id = self._zone["tanks"][self._tank_index]["id"]
-        scales = entry.data.get(DISPLAY_SCALES, {})
-        key = "scale_max_m"
-        value = scales.get(tank_id) if user_input is None else user_input.get(key)
-        valid = type(value) in (int, float) and isfinite(value) and value > 0
-        if user_input is not None and (valid or value is None):
-            self._require_settled(entry)
-            # Replacing entry.options would invalidate the manual controller's
-            # owner token even without reload. Persist display preferences in
-            # entry.data and finish the native flow without an options write.
-            data = dict(entry.data)
-            current_ids = {tank["id"] for zone in self._zones for tank in zone["tanks"]}
-            updated = {ident: scale for ident, scale in scales.items() if ident in current_ids}
-            if valid:
-                updated[tank_id] = value
-            else:
-                updated.pop(tank_id, None)
-            if updated:
-                data[DISPLAY_SCALES] = updated
-            else:
-                data.pop(DISPLAY_SCALES, None)
-            self.hass.config_entries.async_update_entry(entry, data=data)
-            # OptionsFlowManager explicitly skips write/reload for None.
-            return self.async_create_entry(data=None)  # type: ignore[arg-type]
-        return self.async_show_form(
-            step_id="save_display_scale", description_placeholders={"target": self._target_label},
-            data_schema=vol.Schema({
-                vol.Optional(key, description={"suggested_value": value if valid else None}):
-                    _ThresholdNumberSelector({"step": "any", "mode": "box", "unit_of_measurement": "m"}),
-            }),
-            errors={key: "positive_display_scale"} if user_input is not None else {},
-        )
 
     async def async_step_confirm_remove(self, user_input: dict | None = None) -> ConfigFlowResult:
         return self._confirm_remove(user_input)
