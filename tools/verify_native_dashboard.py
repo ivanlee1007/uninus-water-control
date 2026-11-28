@@ -717,12 +717,22 @@ async def open_card_editor(page, label):
     await action.press("Enter")
     await expect(modal).to_have_count(1)
     editor = modal.locator(f"{EDITOR_TAG}:visible")
-    await expect(editor.get_by_role("heading", name="補水參數", exact=True)).to_be_visible()
+    await expect(editor.get_by_role("heading", name="本卡顯示設定", exact=True)).to_be_visible()
     return modal, editor
 
 
+async def open_quick_parameters(page, tank_id):
+    """Trusted normal-card entry, never a Lovelace editor as a backend writer."""
+    shell = page.locator(f"hui-panel-view {CARD_TAG}:visible")
+    await shell.locator(f'[data-tank-id="{tank_id}"] .quick-parameters').click()
+    modal = shell.get_by_role("dialog", name="快捷參數", exact=True)
+    panel = modal.locator(f"{CARD_TAG}-quick-parameters")
+    await expect(panel.get_by_role("heading", name="補水參數", exact=True)).to_be_visible()
+    return modal, panel
+
+
 async def verify_native_editor(hass, entry, outputs, url, screenshots):
-    """Actual HA Lovelace UI and registered WS, separately count every writer."""
+    """Real Lovelace display config plus real per-tank Settings CAS/readback."""
     tank_id, _ = await native_commission(hass, entry)
     synthetic = hass.states.get("sensor.test_depth_1")
     store = Path(entry.runtime_data.settings.store.path)
@@ -749,24 +759,26 @@ async def verify_native_editor(hass, entry, outputs, url, screenshots):
                 page = await ctx.new_page()
                 page.set_default_timeout(8000)
                 await page.add_init_script("""
-                    window.waterEditorErrors = [];
-                    window.waterEditorEvents = 0;
+                    window.waterEditorErrors = []; window.waterEditorEvents = 0;
                     window.waterEditorDialogEvents = [];
-                    addEventListener('show-dialog', e => waterEditorDialogEvents.push(['show', e.detail?.dialogTag, performance.now()]), true);
-                    addEventListener('dialog-closed', e => waterEditorDialogEvents.push(['close', e.detail?.dialog, performance.now()]), true);
-                    addEventListener('popstate', e => waterEditorDialogEvents.push(['popstate', e.state?.dialog ?? null, performance.now()]), true);
-                    addEventListener('unhandledrejection', e => waterEditorErrors.push(e.reason?.code ?? String(e.reason)));
-                    addEventListener('config-changed', e => {
-                        if (e.composedPath().some(el => el.localName === 'uninus-water-dashboard-editor')) waterEditorEvents++;
-                    }, true);
+                    addEventListener('show-dialog', e => waterEditorDialogEvents.push(['show',e.detail?.dialogTag,performance.now()]),true);
+                    addEventListener('dialog-closed', e => waterEditorDialogEvents.push(['close',e.detail?.dialog,performance.now()]),true);
+                    addEventListener('popstate',e=>waterEditorDialogEvents.push(['popstate',e.state?.dialog??null,performance.now()]),true);
+                    addEventListener('unhandledrejection',e=>waterEditorErrors.push(e.reason?.code??String(e.reason)));
+                    addEventListener('config-changed',e=>{
+                      if(e.composedPath().some(el=>el.localName==='uninus-water-dashboard-editor'))waterEditorEvents++;
+                    },true);
                 """)
                 seen, errors = [], []
 
                 def record(raw):
                     if isinstance(raw, str):
                         message = json.loads(raw)
-                        if "id" in message:  # Never store the auth frame or anything with credentials.
+                        if "id" in message:  # Never capture auth frames or credentials.
                             seen.append(message)
+
+                def messages(kind):
+                    return [message for message in seen if message["type"] == kind]
 
                 page.on("websocket", lambda ws: ws.on("framesent", record))
                 page.on("pageerror", lambda error: errors.append(str(error)))
@@ -776,7 +788,6 @@ async def verify_native_editor(hass, entry, outputs, url, screenshots):
                     await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config/save", "config": {"title": TITLE, "views": [
                         {"title": TITLE, "path": "water-editor", "type": "panel", "cards": [{"type": f"custom:{CARD_TAG}"}]},
                     ]}})
-
                 dashboard = url + "/lovelace/water-editor"
                 try:
                     async with page.expect_response(url + URL_PATH) as asset:
@@ -785,186 +796,167 @@ async def verify_native_editor(hass, entry, outputs, url, screenshots):
                         else:
                             await native_login(page, dashboard)
                     assert (await asset.value).ok and await (await asset.value).body() == asserted_asset
-                    await page.wait_for_function("lang => document.querySelector('home-assistant')?.hass?.locale?.language === lang",
+                    await page.wait_for_function("lang=>document.querySelector('home-assistant')?.hass?.locale?.language===lang",
                                                  arg="en" if language == "en-US" else language)
                     shell = page.locator(f"hui-panel-view {CARD_TAG}:visible")
                     start = shell.get_by_role("button", name="手動補水", exact=True).first
                     await expect(start).to_be_enabled()
-                    assert await shell.evaluate("card => [card.preview, card.editMode]") == [False, False]
-                    await expect(shell.locator("input,select")).to_have_count(0)
-                    await expect(shell.get_by_role("button", name="套用整合設定")).to_have_count(0)
+                    assert await shell.evaluate("card=>[card.preview,card.editMode]") == [False, False]
                     baseline = await read_settings(page, entry)
                     disk_before = store.read_bytes() if store.exists() else None
                     prior_options, runtime = entry.options, entry.runtime_data
                     yaml_before = await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"})
-                    assert await page.evaluate("document.querySelector('home-assistant').hass.user.is_admin")
                     seen.clear()
 
-                    def messages(kind):
-                        return [message for message in seen if message["type"] == kind]
-
-                    # Match the actual localized HA tooltip; its target is the Edit dashboard button.
-                    label = await page.evaluate("""() => document.querySelector('home-assistant').hass.localize(
-                        'ui.panel.lovelace.menu.configure_ui')""")
-                    tooltips = page.locator("hui-root ha-tooltip").filter(has_text=label)
-                    if label and await tooltips.count():
-                        ident = await tooltips.first.evaluate("el => el.for ?? el.getAttribute('for')")
-                        assert ident
+                    # Real Lovelace edit/Cancel/Save is now display-only.
+                    label = await page.evaluate("document.querySelector('home-assistant').hass.localize('ui.panel.lovelace.menu.configure_ui')")
+                    tooltip = page.locator("hui-root ha-tooltip").filter(has_text=label)
+                    if label and await tooltip.count():
+                        ident = await tooltip.first.evaluate("el=>el.for??el.getAttribute('for')")
                         await page.locator(f"hui-root ha-icon-button#{ident}").click()
                     else:
                         await page.locator("#dashboardmenu").click()
-                        await page.get_by_text(label or ("Edit dashboard" if language == "en-US" else "編輯主面板"), exact=True).click()
+                        await page.get_by_text(label or "Edit dashboard", exact=True).click()
                     await expect(start).to_be_disabled()
-
-                    async def closed():
-                        await expect(page.locator("hui-dialog-edit-card ha-dialog[open]")).to_have_count(0)
-                        await page.wait_for_function("() => !history.state?.dialog")
-
-                    def scale_field(editor):
-                        return editor.locator(f'[data-tank-id="{tank_id}"]').get_by_role(
-                            "spinbutton", name="水位顯示量程上限（m）", exact=True
-                        )
-
-                    modal, editor = await open_card_editor(page, card_edit)
+                    modal, display = await open_card_editor(page, card_edit)
                     preview = modal.locator(CARD_TAG)
-                    assert await preview.evaluate("card => [card.preview, card.editMode]") == [True, True]
+                    assert await preview.evaluate("card=>[card.preview,card.editMode]") == [True, True]
+                    await expect(display.get_by_role("spinbutton")).to_have_count(0)
+                    await expect(preview.locator(".quick-parameters:visible")).to_have_count(0)
                     preview_start = preview.get_by_role("button", name="手動補水", exact=True).first
                     await expect(preview_start).to_be_disabled()
                     await preview_start.dispatch_event("click")
                     await expect(preview.get_by_role("dialog")).to_have_count(0)
-                    scales = scale_field(editor)
-                    old = await scales.input_value()
-                    await scales.fill("")
-                    await scales.press_sequentially("7.")
-                    remembered = await scales.element_handle()
-                    await scales.evaluate("el => { el.dataset.blurs = 0; el.addEventListener('blur', () => el.dataset.blurs++); }")
-                    sample = "166" if language == "en-US" else "167"
-                    hass.states.async_set(synthetic.entity_id, sample, synthetic.attributes)
-                    await expect(preview.get_by_role("button", name=f"一號水桶 · {int(sample) / 100:.2f} m")).to_be_visible()
-                    await page.keyboard.type("125")
-                    await expect(scales).to_have_value("7.125")
-                    assert await scales.evaluate("(el, old) => el === old && el.getRootNode().activeElement === el && el.dataset.blurs === '0'", remembered)
-                    # The pinned HA wrapper may mark its unchanged value dirty on mount;
-                    # only events from our editor or actual WS writes are our boundary.
-                    assert await page.evaluate("waterEditorEvents") == 0
-                    assert not messages("lovelace/config/save") and not messages(f"{DOMAIN}/config_save")
-
-                    widths[language] = await editor.evaluate("""el => {
-                        const root = el.shadowRoot;
-                        const host = el.getBoundingClientRect();
-                        const visible = [...root.querySelectorAll('input,select,button')].filter(x => x.getClientRects().length);
-                        const grid = root.querySelector('.shared-grid');
-                        return {width:host.width, trackCount:getComputedStyle(grid).gridTemplateColumns.split(' ').length,
-                            noOverflow:visible.every(x => {
-                                const r=x.getBoundingClientRect(); return host.left <= r.left && r.right <= host.right;
-                            })};
-                    }""")
-                    assert widths[language]["noOverflow"]
-                    if screenshots:
-                        await page.screenshot(path=screenshots / f"native-editor-{language}.png")
+                    details = display.get_by_role("checkbox", name="顯示詳細狀態", exact=True)
+                    original_details = await details.is_checked()
+                    await details.set_checked(not original_details)
+                    assert await page.evaluate("waterEditorEvents") == 1
                     await modal.get_by_role("button", name=cancel, exact=True).click()
-                    await closed()
-                    assert not messages(f"{DOMAIN}/config_save")
-                    assert (store.read_bytes() if store.exists() else None) == disk_before
-                    assert await read_settings(page, entry) == baseline
-                    print(f"PASS {language}: trusted draft and state push, preview refused device action, native Cancel has zero writes")
+                    await expect(page.locator("hui-dialog-edit-card ha-dialog[open]")).to_have_count(0)
+                    assert not messages(f"{DOMAIN}/config_get") and not messages(f"{DOMAIN}/config_save")
+                    assert not messages(f"{DOMAIN}/topology_get") and not messages(f"{DOMAIN}/topology_save")
+                    assert not messages("lovelace/config/save") and (store.read_bytes() if store.exists() else None) == disk_before
+                    assert await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"}) == yaml_before
 
-                    modal, editor = await open_card_editor(page, card_edit)
-                    await expect(scale_field(editor)).to_have_value(old)
-                    await scale_field(editor).fill("8.25")
+                    modal, display = await open_card_editor(page, card_edit)
+                    await expect(display.get_by_role("checkbox", name="顯示詳細狀態", exact=True)).to_be_checked(checked=original_details)
                     mode = modal.locator(".gui-mode-button")
                     await mode.click()
-                    await expect(editor).to_have_count(0)
-                    assert not messages(f"{DOMAIN}/config_save")
-                    # Change an unrelated native layout field to prove what outer Save actually persists.
                     yaml_field = modal.locator(".cm-content[contenteditable=true]")
-                    await yaml_field.click()
+                    await yaml_field.click(); await page.keyboard.press("Control+a")
                     columns = 6 if language == "en-US" else 7
-                    await page.keyboard.press("Control+a")
-                    await page.keyboard.insert_text(f"type: custom:{CARD_TAG}\ngrid_options:\n  columns: {columns}\n")
-                    await expect(modal.get_by_role("button", name=save, exact=True)).to_be_enabled()
+                    await page.keyboard.insert_text(f"type: custom:{CARD_TAG}\nshow_details: true\ngrid_options:\n  columns: {columns}\n")
                     await mode.click()
-                    await expect(scale_field(editor)).to_have_value(old)
-                    await scale_field(editor).fill("8.5")
+                    await expect(display.get_by_role("checkbox", name="顯示詳細狀態", exact=True)).to_be_checked()
+                    selected_zone = next(z for z in baseline["zones"] if any(t["id"] == tank_id for t in z["tanks"]))
+                    selected_tank = next(t for t in selected_zone["tanks"] if t["id"] == tank_id)
+                    await display.get_by_role("checkbox", name=selected_zone["name"], exact=True).check()
+                    await display.get_by_role("checkbox", name=f"{selected_zone['name']} · {selected_tank['name']}", exact=True).check()
                     await modal.get_by_role("button", name=save, exact=True).click()
-                    await closed()
+                    await expect(page.locator("hui-dialog-edit-card ha-dialog[open]")).to_have_count(0)
                     assert len(messages("lovelace/config/save")) == 1
-                    assert not messages(f"{DOMAIN}/config_save")
+                    assert not messages(f"{DOMAIN}/config_get") and not messages(f"{DOMAIN}/config_save")
                     assert (store.read_bytes() if store.exists() else None) == disk_before
-                    assert await read_settings(page, entry) == baseline
                     yaml_saved = await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"})
-                    yaml_before["views"][0]["cards"][0]["grid_options"] = {"columns": columns}
-                    assert yaml_saved == yaml_before
-                    print(f"PASS {language}: YAML switch and native outer Save affect only Lovelace")
+                    expected_yaml = deepcopy(yaml_before)
+                    expected_yaml["views"][0]["cards"][0] = {"type": f"custom:{CARD_TAG}", "show_details": True,
+                        "zone_ids": [selected_zone["id"]], "tank_ids": [tank_id], "grid_options": {"columns": columns}}
+                    assert yaml_saved == expected_yaml, (yaml_saved, expected_yaml)
+                    modal, display = await open_card_editor(page, card_edit)
+                    await expect(display.get_by_role("checkbox", name=selected_zone["name"], exact=True)).to_be_checked()
+                    await expect(display.get_by_role("checkbox", name=f"{selected_zone['name']} · {selected_tank['name']}", exact=True)).to_be_checked()
+                    await modal.get_by_role("button", name=cancel, exact=True).click()
+                    await expect(page.locator("hui-dialog-edit-card ha-dialog[open]")).to_have_count(0)
+                    assert not messages(f"{DOMAIN}/config_get") and not messages(f"{DOMAIN}/config_save")
+                    await page.locator("hui-root .exit-edit-mode").click()
+                    await expect(start).to_be_enabled()
+                    print(f"PASS {language}: native display-only Cancel/GUI/YAML/Save, zero private API or equipment calls")
 
+                    # Normal per-tank Quick dialog: draft continuity/cancel and one CAS Save.
                     second = await ctx.new_page()
                     await second.goto(dashboard, wait_until="domcontentloaded")
                     ordinary = second.locator(CARD_TAG)
                     await expect(ordinary.get_by_role("heading", name="補水控制", exact=True)).to_be_visible()
-                    modal, editor = await open_card_editor(page, card_edit)
-                    await expect(scale_field(editor)).to_have_value(old)
-                    maximum = 2.75 if language == "en-US" else 3.25
-                    refill = editor.get_by_role("group", name="共用補水門檻", exact=True)
-                    alarm = editor.get_by_role("group", name="共用低液位告警", exact=True)
+                    modal, quick = await open_quick_parameters(page, tank_id)
+                    scale = quick.get_by_role("spinbutton", name="水位顯示量程上限（m）", exact=True)
+                    old_value = await scale.input_value()
+                    await scale.fill(""); await scale.press_sequentially("7.")
+                    remembered = await scale.element_handle()
+                    await scale.evaluate("el=>{el.dataset.blurs=0;el.addEventListener('blur',()=>el.dataset.blurs++);}")
+                    sample = "166" if language == "en-US" else "167"
+                    hass.states.async_set(synthetic.entity_id, sample, synthetic.attributes)
+                    await expect(shell.get_by_role("button", name=f"一號水桶 · {int(sample)/100:.2f} m")).to_be_visible()
+                    await page.keyboard.type("125")
+                    await expect(scale).to_have_value("7.125")
+                    assert await scale.evaluate("(el,old)=>el===old&&el.getRootNode().activeElement===el&&el.dataset.blurs==='0'", remembered)
+                    assert not messages(f"{DOMAIN}/config_save")
+                    widths[language] = await quick.evaluate("""el=>{
+                      const root=el.shadowRoot,host=el.getBoundingClientRect();
+                      const visible=[...root.querySelectorAll('input,select,button')].filter(x=>x.getClientRects().length);
+                      return {width:host.width,trackCount:getComputedStyle(root.querySelector('.policy-grid')).gridTemplateColumns.split(' ').length,
+                        noOverflow:visible.every(x=>{const r=x.getBoundingClientRect();return host.left<=r.left&&r.right<=host.right;})};
+                    }""")
+                    assert widths[language]["noOverflow"]
+                    if screenshots:
+                        await page.screenshot(path=screenshots / f"native-quick-{language}.png")
+                    await modal.get_by_role("button", name="取消", exact=True).click()
+                    assert not messages(f"{DOMAIN}/config_save")
+                    assert (store.read_bytes() if store.exists() else None) == disk_before
+                    assert await read_settings(page, entry) == baseline
+
+                    modal, quick = await open_quick_parameters(page, tank_id)
+                    scale = quick.get_by_role("spinbutton", name="水位顯示量程上限（m）", exact=True)
+                    await expect(scale).to_have_value(old_value)
+                    await expect(quick.get_by_role("group", name="共用補水門檻", exact=True)).to_have_count(0)
+                    await expect(quick.get_by_role("button", name="編輯區域與水桶", exact=True)).to_have_count(0)
+                    refill = quick.get_by_role("group", name="補水門檻", exact=True)
+                    alarm = quick.get_by_role("group", name="低液位告警", exact=True)
+                    await refill.get_by_role("combobox").select_option("local")
+                    await alarm.get_by_role("combobox").select_option("local")
                     await refill.get_by_role("spinbutton", name="下限（m）", exact=True).fill("0.45")
                     await refill.get_by_role("spinbutton", name="上限（m）", exact=True).fill("1.55")
                     await alarm.get_by_role("spinbutton", name="低位門檻（m）", exact=True).fill("0.3")
                     await alarm.get_by_role("spinbutton", name="延遲（秒）", exact=True).fill("11")
-                    row = editor.locator(f'[data-tank-id="{tank_id}"]')
-                    await row.get_by_role("combobox", name="補水門檻模式").select_option("common")
-                    if language == "zh-Hant":
-                        await row.get_by_role("combobox", name="低液位告警模式").select_option("common")
-                    await scale_field(editor).fill(str(maximum))
-                    applied_meter = ordinary.get_by_role("meter", name=f"水位量程：0–{maximum} m")
-                    await expect(applied_meter).to_have_count(0)
-                    await editor.get_by_role("button", name="套用整合設定", exact=True).click()
-                    await expect(editor.get_by_text("已套用；不必再按外層儲存。", exact=True)).to_be_visible()
-                    await expect(applied_meter).to_be_visible()
-                    writes = messages(f"{DOMAIN}/config_save")
-                    assert len(writes) == 1 and len(messages("lovelace/config/save")) == 1
-                    [write] = writes
-                    assert (write["version"], write["entry_id"], write["if_revision"], write["if_source_snapshot"]) == (
-                        1, entry.entry_id, baseline["revision"], baseline["source_snapshot"],
-                    )
-                    assert any(request["id"] > write["id"] and request.get("entry_id") == entry.entry_id
-                               for request in messages(f"{DOMAIN}/config_get"))
+                    maximum = 2.75 if language == "en-US" else 3.25
+                    await scale.fill(str(maximum))
+                    await quick.get_by_role("button", name="儲存此桶參數", exact=True).click()
+                    await expect(quick.get_by_text("已儲存並重新讀回確認。", exact=True)).to_be_visible()
+                    [write] = messages(f"{DOMAIN}/config_save")
+                    assert len(messages("lovelace/config/save")) == 1
+                    assert (write["version"],write["entry_id"],write["if_revision"],write["if_source_snapshot"]) == (
+                        1,entry.entry_id,baseline["revision"],baseline["source_snapshot"])
+                    assert set(write["changes"]) == {"tanks"} and [t["id"] for t in write["changes"]["tanks"]] == [tank_id]
+                    assert any(msg["id"]>write["id"] and msg.get("entry_id")==entry.entry_id for msg in messages(f"{DOMAIN}/config_get"))
                     persisted = await read_settings(page, entry)
-                    tank = next(t for z in persisted["zones"] for t in z["tanks"] if t["id"] == tank_id)
-                    assert persisted["common"] == {"refill": [0.45, 1.55], "alarm": [0.3, 11]}
-                    assert tank["scale_max_m"] == maximum and tank["refill"]["use_common"]
-                    assert tank["alarm"]["use_common"] == (language == "zh-Hant")
+                    tank = next(t for z in persisted["zones"] for t in z["tanks"] if t["id"]==tank_id)
+                    assert persisted["common"] == baseline["common"]
+                    assert tank["scale_max_m"] == maximum and tank["refill"]["effective"] == [0.45,1.55]
+                    assert tank["alarm"]["effective"] == [0.3,11] and not tank["refill"]["use_common"] and not tank["alarm"]["use_common"]
+                    for before_zone, after_zone in zip(baseline["zones"],persisted["zones"],strict=True):
+                        assert [{k:v for k,v in t.items()} for t in before_zone["tanks"] if t["id"]!=tank_id] == [t for t in after_zone["tanks"] if t["id"]!=tank_id]
                     assert entry.options is prior_options and entry.runtime_data is runtime
-                    physical = store.read_bytes()
-                    assert physical != disk_before
-                    assert json.loads(physical)["data"]["common"] == persisted["common"]
-                    await modal.get_by_role("button", name=cancel, exact=True).click()
-                    await closed()
-                    assert await read_settings(page, entry) == persisted and store.read_bytes() == physical
-                    assert await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"}) == yaml_saved
-                    for card in (ordinary, shell):
-                        await expect(card.get_by_role("meter", name=f"水位量程：0–{maximum} m")).to_be_visible()
-                    modal, editor = await open_card_editor(page, card_edit)
-                    await expect(scale_field(editor)).to_have_value(str(maximum))
-                    await modal.get_by_role("button", name=cancel, exact=True).click()
-                    await closed()
-                    await page.locator("hui-root .exit-edit-mode").click()
-                    await expect(start).to_be_enabled()
-                    assert await shell.evaluate("card => [card.preview, card.editMode]") == [False, False]
+                    physical=store.read_bytes()
+                    assert physical!=disk_before and json.loads(physical)["data"]["common"] == persisted["common"]
+                    await modal.get_by_role("button",name="取消",exact=True).click()
+                    assert await read_settings(page,entry)==persisted and store.read_bytes()==physical
+                    assert await page.evaluate(SETTINGS_CALL,{"type":"lovelace/config"})==yaml_saved
+                    for card in (ordinary,shell):
+                        await expect(card.get_by_role("meter",name=f"水位量程：0–{maximum} m")).to_be_visible()
+                    modal,quick=await open_quick_parameters(page,tank_id)
+                    await expect(quick.get_by_role("spinbutton",name="水位顯示量程上限（m）",exact=True)).to_have_value(str(maximum))
+                    await modal.get_by_role("button",name="取消",exact=True).click()
                     assert not messages("call_service") and outputs.calls.empty()
-                    assert len(messages(f"{DOMAIN}/config_save")) == 1
+                    assert len(messages(f"{DOMAIN}/config_save"))==1 and not messages(f"{DOMAIN}/topology_save")
                     assert not errors and not await page.evaluate("waterEditorErrors")
-                    assert await page.evaluate("waterEditorEvents") == 0
-                    print(f"PASS {language}: one Apply and independent readback; two ordinary cards updated; Cancel does not undo it")
+                    print(f"PASS {language}: normal Quick trusted typing/Cancel, one selected-tank CAS Save, independent durable readback, two cards converge")
                 except Exception:
-                    print(f"EDITOR DIAGNOSTIC {language}: {await page.locator('body').aria_snapshot()}")
-                    state = await page.evaluate("({history:history.state, path:location.pathname, events:waterEditorDialogEvents})")
-                    print(f"Editor native state: {state}")
+                    print(f"C EDITOR DIAGNOSTIC {language}: {await page.locator('body').aria_snapshot()}")
                     if screenshots:
-                        await page.screenshot(path=screenshots / f"native-editor-diagnostic-{language}.png")
+                        await page.screenshot(path=screenshots / f"native-c-diagnostic-{language}.png")
                     raise
-        assert widths["en-US"]["trackCount"] == 2 and widths["zh-Hant"]["trackCount"] == 1, widths
+        assert widths["en-US"]["trackCount"]==2 and widths["zh-Hant"]["trackCount"]==1,widths
         if screenshots:
-            (screenshots / "native-editor-geometry.json").write_text(json.dumps(widths, indent=2), encoding="utf-8")
+            (screenshots / "native-quick-geometry.json").write_text(json.dumps(widths,indent=2),encoding="utf-8")
 
 
 async def verify_reference(browser, base_url, hass, entry, outputs, screenshots, reference, restrict):
@@ -1101,6 +1093,9 @@ async def main(login_only: bool, screenshots: Path | None, reference: Path | Non
         try:
             assert await bootstrap.async_from_config_dict(core_config, hass) is hass
             assert "frontend" in hass.config.components and "lovelace" in hass.config.components
+            # Native Options is an operation on a running Core, not a startup
+            # seed bypass. Keep the real Settings live-owner guard intact.
+            await hass.async_start()
             owner = await hass.auth.async_create_user("Local Water Test", group_ids=[GROUP_ID_ADMIN], local_only=True)
             assert owner.is_admin
             if not login_only:
@@ -1119,7 +1114,6 @@ async def main(login_only: bool, screenshots: Path | None, reference: Path | Non
                     await native_add_tank(hass, entry, pos, PASSIVE_ALARM if pos == 2 and history_only else None)
             else:
                 entry = None
-            await hass.async_start()
             url = f"http://127.0.0.1:{port}"
             if editor_only:
                 await verify_native_editor(hass, entry, outputs, url, screenshots)

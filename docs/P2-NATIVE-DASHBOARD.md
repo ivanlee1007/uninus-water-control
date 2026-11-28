@@ -1,4 +1,6 @@
-# P2 — 原生唯讀補水總覽
+# P2 — 原生唯讀補水總覽（歷史階段規格）
+
+> 本文保留 P2 原始凍結契約與驗收歷史，非現行 UI／設定入口要求。現行採使用者核准的 [C 方案](C-ARCHITECTURE.md)：保留自訂液位圖與排版、卡片編輯器僅改顯示、日常卡片快捷參數寫後端、設備及安全設定在 Options。
 
 > **For Hermes:** Implement as one integrated slice; use `subagent-driven-development`, freeze the candidate for SPEC then quality review before publication. P1 PR #1 remains open. Base P2 on P1 commit `1626196cc43b24e337145cf6f11020d78da698ce`; P2 PR targets the P1 feature branch. No merge, release, HACS listing, or connection to Jingan.
 

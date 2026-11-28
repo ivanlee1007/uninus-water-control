@@ -21,7 +21,10 @@
       "invalid_sensor": "請選擇感測器實體。",
       "invalid_switch": "請選擇開關實體，或將此欄位留空。",
       "own_level_sensor": "請選擇來源感測器，勿選擇由此整合建立的水位感測器。",
-      "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。"
+      "level_source_changed": "此表單開啟後，使用該實體 ID 的感測器已變更。請確認選取的感測器。若要使用原實體 ID 的替代感測器，請重新開啟此表單並選取該感測器。",
+      "output_source_changed": "使用此實體 ID 的開關已變更。請重新開啟表單並選擇正確的開關。",
+      "shared_output": "另一用途已參照此輸出或裝置；請先確認現場對應，排除共用。",
+      "shared_source": "另一個水箱已參照此水位來源；請先確認現場對應。"
     },
     "abort": {
       "already_configured": "水位控制器已設定。請使用「設定」管理區域與水箱。"
@@ -34,7 +37,9 @@
         "menu_options": {
           "add_zone": "新增區域", "edit_zone": "重新命名區域", "remove_zone": "移除區域",
           "add_tank": "新增水箱", "edit_tank": "編輯水箱", "remove_tank": "移除水箱",
-          "card_settings": "門檻與量程：儀表板卡片編輯器",
+          "card_settings": "共用參數",
+          "common_parameters": "共用預設參數",
+          "tank_parameters": "水箱個別參數",
           "enroll_topology": "將區域與水箱移轉至整合儲存",
           "topology_status": "區域與水箱移轉狀態"
         }
@@ -51,6 +56,34 @@
         "title": "準備移轉區域與水箱",
         "description": "先確認 Home Assistant 備份可用，預留兩次完整重啟 Core 的維護時間，並保持裝置側獨立關斷。送出申請不代表移轉完成，也不代表設備實際已關閉。",
         "data": {"confirm_device_cutoff": "我已驗證備份，並獨立確認關斷保護及設備的實際安全狀態"}
+      },
+      "common_parameters": {
+        "title": "共用預設參數",
+        "description": "共用值會影響所有沿用共用設定的水箱，以及顯示這些水箱的卡片。目前門檻僅供唯讀預覽，不會啟用自動控制。僅明確儲存才寫入，取消不寫入。",
+        "data": {
+          "refill_enabled": "設定共用補水門檻",
+          "refill_lower_m": "補水下限（公尺）",
+          "refill_upper_m": "補水上限（公尺）",
+          "alarm_enabled": "設定共用低液位告警參數",
+          "alarm_lower_m": "低液位告警門檻（公尺）",
+          "alarm_delay_seconds": "低液位告警延遲（秒）"
+        }
+      },
+      "save_parameters": {
+        "title": "水箱個別參數",
+        "description": "變更會影響所有顯示此水箱的卡片。可沿用共用設定，或保留此桶的個別成對參數。目前門檻僅供唯讀預覽，不會啟用自動控制。僅明確儲存才寫入，取消不寫入。",
+        "data": {
+          "refill_use_common": "沿用共用補水門檻",
+          "refill_enabled": "保留此桶個別補水門檻",
+          "refill_lower_m": "此桶補水下限（公尺）",
+          "refill_upper_m": "此桶補水上限（公尺）",
+          "alarm_use_common": "沿用共用低液位告警參數",
+          "alarm_enabled": "保留此桶個別低液位告警參數",
+          "alarm_lower_m": "此桶低液位告警門檻（公尺）",
+          "alarm_delay_seconds": "此桶低液位告警延遲（秒）",
+          "scale_enabled": "設定液位圖量程",
+          "scale_max_m": "液位圖最大值（公尺）"
+        }
       },
       "add_zone": {
         "title": "新增區域及其第一個水箱",
@@ -97,6 +130,7 @@
       "invalid_switch": "請選擇開關實體，或將此欄位留空。",
       "own_level_sensor": "請選擇來源感測器，勿選擇由此整合建立的水位感測器。",
       "confirm_required": "請開啟確認選項，才能移除所選項目。",
+      "invalid_parameters": "請輸入完整且有效的成對參數：補水下限須小於上限、告警延遲須為 1 到 2147483647 的整數秒，液位圖量程須大於零。沿用共用設定前，必須先設定共用值。",
       "one_manual_tank": "請先停用另一水箱的手動控制，再啟用此水箱。",
       "cutoff_required": "啟用前請先驗證輸出為獨用，且裝置具備獨立關斷保護。",
       "registered_output_required": "請選擇已登錄且啟用的開關。不可使用已知的虛擬開關或群組。",

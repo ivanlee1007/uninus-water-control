@@ -177,7 +177,7 @@ def test_overview_summarizes_per_tank_previews_without_inventing_scale_or_output
     assert first.get_by_text("未設定水位量程", exact=True).is_visible()
     page.get_by_role("button", name="補水參數", exact=True).click()
     assert page.get_by_role("link").count() == 0
-    assert "編輯儀表板 → 編輯補水卡片" in page.get_by_role("region", name="補水參數").inner_text()
+    assert "快捷參數" in page.get_by_role("region", name="補水參數").inner_text()
     assert page.locator("input,select").count() == 0
     page.evaluate("""() => {
         states['binary_sensor.low'] = {...states['binary_sensor.low'], state: 'off'};

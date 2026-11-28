@@ -26,6 +26,9 @@ ACTIONS = ("start", "stop", "reset")
 DEFAULT_SECONDS = 60
 FEEDBACK_SECONDS = 2
 RETRY_SECONDS = 2
+# A blocking Core service awaits the provider inline: cancellation reaches it.
+# Keep its one task owned until it really exits, even if it suppresses cancellation.
+OFF_CALL_SECONDS = 2
 CLOSE_SECONDS = 3
 RESTART_REQUIRED = "restart_required"
 VIRTUAL_OUTPUTS = {DOMAIN, "group", "template", "switch_as_x"}
@@ -92,7 +95,8 @@ class ManualController:
         self.enrollment = settings.enrollment if settings else None
         self.registry = er.async_get(hass)
         self.zones = settings.zones if settings else inventory(entry)
-        self.retiring = False
+        # Platform setup must succeed before this controller can own outputs.
+        self.retiring = True
         self.restart_required = False
         self.shutdown_deadline: float | None = None
         self.tank = None
@@ -111,10 +115,15 @@ class ManualController:
                     binding = Binding(settings["output"], settings.get("source"), settings["max_runtime_seconds"])
                     self.roles[role] = ManualRole(self, role, binding)
         self._unsubs = []
+
+    @callback
+    def activate(self):
+        """Acquire observation/closure ownership only after platform setup."""
+        self.retiring = False
         if self.roles:
             self._unsubs = [
-                hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._registry_changed),
-                hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, self._on_shutdown),
+                self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._registry_changed),
+                self.hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, self._on_shutdown),
             ]
             for role in self.roles.values():
                 role.observe()
@@ -499,7 +508,11 @@ class ManualRole:
                 if desired == STATE_OFF:
                     self._capture_off_baseline(row.entity_id)
                 sent = True
-                deadline = self.owner.shutdown_deadline if desired == STATE_OFF else None
+                deadline = None
+                if desired == STATE_OFF:
+                    deadline = self.hass.loop.time() + OFF_CALL_SECONDS
+                    if self.owner.shutdown_deadline is not None:
+                        deadline = min(deadline, self.owner.shutdown_deadline)
                 async with asyncio.timeout_at(deadline):
                     await self.hass.services.async_call(
                         "switch",
@@ -510,6 +523,8 @@ class ManualRole:
                     )
             elif self.requested:
                 failure = "start_guard_changed"
+        except TimeoutError:
+            failure = "off_unconfirmed" if desired == STATE_OFF else "command_failed"
         except asyncio.CancelledError:
             failure = "command_interrupted"
             raise

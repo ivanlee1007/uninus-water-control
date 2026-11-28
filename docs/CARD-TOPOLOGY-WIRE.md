@@ -1,4 +1,6 @@
-# Card topology WebSocket contract v1
+# Topology WebSocket compatibility contract v1
+
+Under the approved [C architecture](C-ARCHITECTURE.md), the shipped card no longer offers topology editing. Add/remove/rename/bind and safety commissioning belong to native integration Options. These authenticated v1 commands remain a backend compatibility/verification interface; they do not imply that a Lovelace editor should perform integration writes.
 
 Additive commands on the existing authenticated HA connection: `uninus_water_control/topology_get` and `uninus_water_control/topology_save`. `config_get` and `config_save` v1 are unchanged. Every command uses exactly `type`, `version` (integer `1`), `entry_id` and the Core message `id`; Save also requires `if_revision`, `if_source_snapshot`, `zones`, `remove` and `changes`. The two tokens match the v1 settings tokens; same revision and one durable generation/CAS gate across settings, topology and protected Options.
 

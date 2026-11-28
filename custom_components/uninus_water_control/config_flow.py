@@ -6,7 +6,7 @@ import asyncio
 from copy import deepcopy
 
 import voluptuous as vol
-from homeassistant.components.http.const import KEY_HASS_USER
+from homeassistant.components.http.const import KEY_HASS_REFRESH_TOKEN_ID, KEY_HASS_USER
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.data_entry_flow import AbortFlow
@@ -15,9 +15,10 @@ from homeassistant.helpers.http import current_request
 from homeassistant.helpers.selector import BooleanSelector, EntitySelector, NumberSelector, SelectSelector, TextSelector
 
 from . import async_prune_disabled_levels
-from .inventory import DOMAIN, TITLE, Zone, inventory, level_source, new_tank, new_zone
+from .binding_validation import binding_errors
+from .inventory import DOMAIN, TITLE, Zone, binding_source, inventory, level_source, new_tank, new_zone
 from .manual import DEFAULT_SECONDS, ROLES, output_conflicts, output_row, source_conflicts
-from .settings import SettingsError
+from .settings import LEGACY_PROVENANCE, PAIRS, Settings, SettingsError
 from .topology_lifecycle import MARK, VERSION as TOPOLOGY_VERSION, enrollment_fence, request_enrollment, valid_witness, witness
 
 LEVEL_SENSOR = "level_sensor"
@@ -56,8 +57,8 @@ def _field_errors(hass: HomeAssistant, values: dict) -> dict[str, str]:
     return errors
 
 
-class _LevelSuggestions:
-    """Keep the registry identity behind every level selector default in a flow."""
+class _BindingSuggestions:
+    """Fence every selector default, including passive outputs and error echoes."""
 
     def __init__(self) -> None:
         self._shown: dict[str, str | None] = {}
@@ -75,20 +76,22 @@ class _LevelSuggestions:
         errors: dict[str, str] = {}
         if user_input is not None:
             errors = _field_errors(hass, user_input)
-            selected = user_input[LEVEL_SENSOR]
-            if selected in self._shown and self._shown[selected] != self._row_id(registry, selected):
-                # An unchanged native default and a deliberate choice of the same
-                # string are indistinguishable. Retain the first identity on replay.
-                errors[LEVEL_SENSOR] = "level_source_changed"
-                values[LEVEL_SENSOR] = (defaults or {}).get(LEVEL_SENSOR)
+            for field in ENTITY_FIELDS:
+                selected = user_input.get(field)
+                if selected and selected in self._shown and self._shown[selected] != self._row_id(registry, selected):
+                    # An unchanged default and a deliberate choice of the same
+                    # string are indistinguishable. Retain the first identity.
+                    errors[field] = "level_source_changed" if field == LEVEL_SENSOR else "output_source_changed"
+                    values[field] = (defaults or {}).get(field)
         return values, errors
 
     def capture(self, registry: er.EntityRegistry, values: dict) -> None:
         """Record what the form will show, after all submission checks."""
-        if suggested := values.get(LEVEL_SENSOR):
-            row_id = self._row_id(registry, suggested)
-            if self._shown.setdefault(suggested, row_id) != row_id:
-                values[LEVEL_SENSOR] = None
+        for field in ENTITY_FIELDS:
+            if suggested := values.get(field):
+                row_id = self._row_id(registry, suggested)
+                if self._shown.setdefault(suggested, row_id) != row_id:
+                    values[field] = None
 
 
 class WaterControlConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -97,16 +100,19 @@ class WaterControlConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = TOPOLOGY_VERSION
 
     def __init__(self) -> None:
-        self._level_suggestions = _LevelSuggestions()
+        self._binding_suggestions = _BindingSuggestions()
 
     async def async_step_user(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Set up the initial inventory in one native form."""
         await self.async_set_unique_id(DOMAIN, raise_on_progress=False)
         self._abort_if_unique_id_configured()
-        values, errors = self._level_suggestions.form_input(self.hass, user_input)
+        values, errors = self._binding_suggestions.form_input(self.hass, user_input)
         if user_input is not None and not errors:
-            return self.async_create_entry(title=TITLE, data={"zones": [new_zone(er.async_get(self.hass), user_input)]})
-        self._level_suggestions.capture(er.async_get(self.hass), values)
+            zones = [new_zone(er.async_get(self.hass), user_input)]
+            errors = {field: error for (_, field), error in binding_errors(er.async_get(self.hass), [], zones).items()}
+            if not errors:
+                return self.async_create_entry(title=TITLE, data={"zones": zones})
+        self._binding_suggestions.capture(er.async_get(self.hass), values)
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({**_text_field("zone_name", values), **_tank_fields(values)}),
@@ -130,16 +136,22 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         self._zone_index: int
         self._tank_index: int | None
         self._target_label: str
-        self._level_suggestions = _LevelSuggestions()
+        self._binding_suggestions = _BindingSuggestions()
         self._manual_delta: dict = {}
-        self._shown_outputs: dict[str, str | None] = {}
+
+    @callback
+    def async_remove(self) -> None:
+        """Retire cached parameters on native cancellation, denial or completion."""
+        self.__dict__.pop("_parameter_snapshot", None)
+        self._binding_suggestions._shown.clear()
+        super().async_remove()
 
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Take a draft snapshot and show available operations."""
         if self._entry is None:
             self._entry = entry = self.config_entry
+            self._actor = self._native_actor()
             if MARK in entry.data:
-                self._actor = self._native_actor()
                 if (reason := self._enrollment_block(entry)) is not None:
                     return self.async_abort(reason=reason)
             self._require_writer(entry)
@@ -151,13 +163,15 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             self._base_manual = settings.manual if self._owned else self._base_options.get("manual") or {}
             self._base_settings_generation = settings.generation if settings else None
             self._zones = deepcopy(inventory(entry))
+            self._original_zones = deepcopy(self._zones)
         self._require_fresh()
-        operations = ["edit_tank", "card_settings"] if self._owned else [
-            "add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank", "card_settings",
-        ]
+        # The menu admits native operations for both inventory owners; the
+        # owned writer remains the only persistence boundary.
+        operations = ["add_zone", "edit_zone", "remove_zone", "add_tank", "edit_tank", "remove_tank"]
         if not self._owned and self._entry.state is ConfigEntryState.LOADED:
             operations.append("enroll_topology")
         operations.append("topology_status")
+        operations.extend(["common_parameters", "tank_parameters"])
         return self.async_show_menu(
             step_id="init",
             menu_options=operations,
@@ -224,26 +238,131 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
 
     async def async_step_add_zone(self, user_input: dict | None = None) -> ConfigFlowResult:
         self._operation = "add_zone"
-        return self._zone_form("add_zone", user_input)
+        return await self._zone_form("add_zone", user_input)
 
     async def async_step_edit_zone(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("edit_zone")
+        return await self._choose("edit_zone")
 
     async def async_step_remove_zone(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("remove_zone")
+        return await self._choose("remove_zone")
 
     async def async_step_add_tank(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("add_tank")
+        return await self._choose("add_tank")
 
     async def async_step_edit_tank(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("edit_tank")
+        return await self._choose("edit_tank")
 
     async def async_step_remove_tank(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._choose("remove_tank")
+        return await self._choose("remove_tank")
 
     async def async_step_card_settings(self, user_input: dict | None = None) -> ConfigFlowResult:
-        """Direct users to the single owner without presenting a second form."""
-        return self.async_abort(reason="card_settings_in_dashboard_editor")
+        """Compatibility navigation; parameters now also have a native editor."""
+        return await self.async_step_common_parameters(user_input)
+
+    async def async_step_common_parameters(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return await self._parameters("common_parameters", user_input)
+
+    async def async_step_tank_parameters(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return await self._choose("tank_parameters")
+
+    async def async_step_save_parameters(self, user_input: dict | None = None) -> ConfigFlowResult:
+        return await self._parameters("save_parameters", user_input)
+
+    async def _authorize_parameters(self):
+        entry = self.hass.config_entries.async_get_entry(self.handler)
+        if (entry is not self._entry or entry.data is not self._base_data or entry.options is not self._base_options
+                or getattr(entry, "runtime_data", None) is not self._base_owner):
+            raise AbortFlow("configuration_changed")
+        actor = self._native_actor()
+        if actor is not self._actor:
+            raise AbortFlow("topology_admin_required")
+        if actor is not None and await self.hass.auth.async_get_user(actor.id) is not actor:
+            raise AbortFlow("topology_admin_required")
+        if self._native_actor() is not self._actor:
+            raise AbortFlow("topology_admin_required")
+
+    async def _parameters(self, step_id, user_input):
+        entry = self._require_fresh()
+        settings = getattr(getattr(entry, "runtime_data", None), "settings", None)
+        if settings is None:
+            raise AbortFlow("entry_not_loaded")
+        errors = {}
+        try:
+            if not hasattr(self, "_parameter_snapshot"):
+                self._parameter_snapshot = await settings.async_request(
+                    self._authorize_parameters, {"type": f"{DOMAIN}/config_get"})
+                self._require_fresh()
+            snapshot = self._parameter_snapshot
+            common = step_id == "common_parameters"
+            tank = None if common else next(
+                t for z in snapshot["zones"] for t in z["tanks"] if t["id"] == self._parameter_tank_id)
+            values = {}
+            for kind, names in PAIRS.items():
+                pair = snapshot["common"][kind] if common else tank[kind]["local"]
+                values[f"{kind}_enabled"] = pair is not None
+                if not common:
+                    values[f"{kind}_use_common"] = tank[kind]["use_common"]
+                values.update(zip(names, pair or (None, None), strict=True))
+            if not common:
+                values.update(scale_enabled=tank["scale_max_m"] is not None, scale_max_m=tank["scale_max_m"])
+            if user_input is not None:
+                values.update(user_input)
+                pairs = {kind: [values.get(name) for name in names] if values[f"{kind}_enabled"] else None
+                         for kind, names in PAIRS.items()}
+                # Suggested values are not new edits. Diff the frozen Get,
+                # preserving supported legacy numbers without relaxing Save caps.
+                delta = {}
+                for kind, pair in pairs.items():
+                    previous = snapshot["common"][kind] if common else tank[kind]["local"]
+                    if common:
+                        if pair != previous:
+                            delta[kind] = pair
+                    else:
+                        mode = {}
+                        if pair != previous:
+                            mode["local"] = pair
+                        if values[f"{kind}_use_common"] != tank[kind]["use_common"]:
+                            mode["use_common"] = values[f"{kind}_use_common"]
+                        if mode:
+                            delta[kind] = mode
+                if not common:
+                    scale = values.get("scale_max_m") if values["scale_enabled"] else None
+                    if scale != tank["scale_max_m"]:
+                        delta["scale_max_m"] = scale
+                changes = ({"common": delta} if common else
+                           {"tanks": [{"id": self._parameter_tank_id, **delta}]}) if delta else {}
+                message = {"type": f"{DOMAIN}/config_save", "if_revision": snapshot["revision"],
+                           "if_source_snapshot": snapshot["source_snapshot"], "changes": changes}
+
+                async def save_and_verify():
+                    saved = await settings.async_request(self._authorize_parameters, message)
+                    observed = await settings.async_request(self._authorize_parameters, {"type": f"{DOMAIN}/config_get"})
+                    if observed != saved:
+                        raise SettingsError("readback_required")
+
+                await asyncio.shield(self.hass.async_create_task(save_and_verify(), "water native parameters"))
+                return self.async_create_entry(data=None)
+        except SettingsError as err:
+            reason = str(err)
+            if reason == "invalid_format":
+                errors = {"base": "invalid_parameters"}
+            else:
+                raise AbortFlow("configuration_changed" if reason in ("stale_revision", "stale_source") else
+                                reason if reason in ("entry_not_loaded", "readback_required") else
+                                "topology_writer_unavailable") from err
+        fields = {}
+        for kind, names in PAIRS.items():
+            if step_id != "common_parameters":
+                field = f"{kind}_use_common"
+                fields[vol.Optional(field, description={"suggested_value": values[field]})] = BooleanSelector()
+            field = f"{kind}_enabled"
+            fields[vol.Optional(field, description={"suggested_value": values[field]})] = BooleanSelector()
+            for field in names:
+                fields[vol.Optional(field, description={"suggested_value": values.get(field)})] = NumberSelector({"mode": "box"})
+        if step_id != "common_parameters":
+            fields[vol.Optional("scale_enabled", description={"suggested_value": values["scale_enabled"]})] = BooleanSelector()
+            fields[vol.Optional("scale_max_m", description={"suggested_value": values["scale_max_m"]})] = NumberSelector({"mode": "box"})
+        return self.async_show_form(step_id=step_id, data_schema=vol.Schema(fields), errors=errors)
 
     def _require_fresh(self, *, require_writer: bool = True) -> ConfigEntry:
         entry = self.hass.config_entries.async_get_entry(self.handler)
@@ -256,7 +375,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             or (self._owned and getattr(entry, "runtime_data", None) is not self._base_owner)
         ):
             raise AbortFlow("configuration_changed")
-        if self._owned and self._native_actor() is not self._actor:
+        if self._native_actor() is not self._actor:
             raise AbortFlow("topology_admin_required")
         settings = getattr(getattr(entry, "runtime_data", None), "settings", None)
         if (settings.generation if settings else None) != self._base_settings_generation:
@@ -267,7 +386,9 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
     def _require_writer(entry: ConfigEntry) -> None:
         owner = getattr(entry, "runtime_data", None)
         if MARK in entry.data:
-            if owner is None or owner.settings.topology is None:
+            if entry.state is not ConfigEntryState.LOADED or owner is None or owner.retiring:
+                raise AbortFlow("entry_not_loaded")
+            if owner.settings.topology is None:
                 raise AbortFlow("topology_writer_unavailable")
             try:
                 owner.settings.require_live()
@@ -281,13 +402,15 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         if entry.state is not ConfigEntryState.LOADED or owner is None or owner.retiring:
             raise AbortFlow("entry_not_loaded")
 
-    @staticmethod
-    def _native_actor():
+    def _native_actor(self):
         request = current_request.get()
         if request is None:
             return None  # Trusted in-process native manager, not an HTTP request.
         actor = request.get(KEY_HASS_USER)
         if actor is None or not actor.is_active or not actor.is_admin or actor.system_generated:
+            raise AbortFlow("topology_admin_required")
+        token = self.hass.auth.async_get_refresh_token(request.get(KEY_HASS_REFRESH_TOKEN_ID))
+        if token is None or token.user is not actor:
             raise AbortFlow("topology_admin_required")
         return actor
 
@@ -297,15 +420,55 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         if runtime and (runtime.retiring or any(not role.closed for role in runtime.roles.values())):
             raise AbortFlow("manual_outputs_unsettled")
 
-    def _commit(self) -> ConfigFlowResult:
+    async def _commit_legacy_inventory(self) -> ConfigFlowResult:
+        entry = self._require_fresh()
+        settings = getattr(getattr(entry, "runtime_data", None), "settings", None)
+        if settings is None:
+            # User-disabled legacy entries have no active numeric writer. Read
+            # the SAME Store without writing/activating an owner, then recheck
+            # disabled admission and native CAS before one Options transaction.
+            reader = Settings(self.hass, entry)
+            source = reader.source_snapshot(self._zones)
+            try:
+                data = await reader.async_read()
+            except SettingsError as err:
+                raise AbortFlow("topology_writer_unavailable") from err
+            await self._authorize_parameters()
+            self._require_fresh()
+            if (entry.state is not ConfigEntryState.NOT_LOADED or not entry.disabled_by
+                    or getattr(entry, "runtime_data", None) is not None
+                    or reader.source_snapshot(self._zones) != source
+                    or binding_errors(er.async_get(self.hass), self._original_zones, self._zones)):
+                raise AbortFlow("configuration_changed")
+            return self._commit(reader.legacy_provenance(self._zones, data))
+        if settings.lock.locked():
+            raise AbortFlow("configuration_changed")
+        source = settings.source_snapshot(self._zones)
+        try:
+            async with settings.lock:
+                settings.require_live()
+                data = await settings.async_read()
+                await self._authorize_parameters()
+                settings.require_live()
+                self._require_fresh()
+                self._require_settled(entry)
+                if data != settings.data or settings.source_snapshot(self._zones) != source:
+                    raise AbortFlow("configuration_changed")
+                if binding_errors(er.async_get(self.hass), self._original_zones, self._zones):
+                    raise AbortFlow("configuration_changed")
+                # The bridge and new bindings are one native Options image.
+                # No numeric write, no two-file commit or rollback is implied.
+                return self._commit(settings.legacy_provenance(self._zones, data))
+        except SettingsError as err:
+            raise AbortFlow("entry_not_loaded" if str(err) == "entry_not_loaded"
+                            else "topology_writer_unavailable") from err
+
+    def _commit(self, provenance) -> ConfigFlowResult:
         # Core's OptionsFlowManager updates the options synchronously on this
         # return path; do not put an await between this check and that update.
         entry = self._require_fresh()
         if self._owned:
             raise AbortFlow("topology_writer_unavailable")
-        settings = getattr(getattr(entry, "runtime_data", None), "settings", None)
-        if settings and settings.lock.locked():
-            raise AbortFlow("configuration_changed")
         self._require_settled(entry)
         if (manual := self._base_options.get("manual")) and not any(
             tank["id"] == manual["tank_id"] for zone in self._zones for tank in zone["tanks"]
@@ -315,16 +478,20 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             # Disabled entries do not set up on reload. Read only the committed
             # native options on the next loop turn, never this private draft.
             self.hass.loop.call_soon(async_prune_disabled_levels, self.hass, entry)
-        return self.async_create_entry(data={**self._base_options, "zones": self._zones} | self._manual_delta)
+        options = {**self._base_options, "zones": self._zones} | self._manual_delta
+        options.pop(LEGACY_PROVENANCE, None)
+        if provenance:
+            options[LEGACY_PROVENANCE] = provenance
+        return self.async_create_entry(data=options)
 
-    async def _commit_owned_tank(self) -> ConfigFlowResult:
+    async def _commit_owned_inventory(self) -> ConfigFlowResult:
         entry = self._require_fresh()
-        if self._operation != "edit_tank":
-            raise AbortFlow("topology_writer_unavailable")
         self._require_settled(entry)
         settings = entry.runtime_data.settings
         source = settings.source_snapshot(self._zones)
         manual = self._manual_delta.get("manual", self._base_manual)
+        if manual and not any(t["id"] == manual["tank_id"] for z in self._zones for t in z["tanks"]):
+            manual = {}
 
         async def authorize():
             actor = self._native_actor()
@@ -348,16 +515,22 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
                             else "topology_writer_unavailable") from err
         return self.async_create_entry(data=None)
 
-    def _choose(self, operation: str) -> ConfigFlowResult:
+    async def _choose(self, operation: str) -> ConfigFlowResult:
         self._operation = operation
-        return self._target_form(None)
+        return await self._target_form(None)
 
     async def async_step_select_target(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._target_form(user_input)
+        if self._operation == "tank_parameters" and user_input is not None:
+            self._require_fresh()
+            self._parameter_tank_id = user_input["tank_id"]
+            if not any(t["id"] == self._parameter_tank_id for z in self._zones for t in z["tanks"]):
+                return self.async_abort(reason="invalid_target")
+            return await self._parameters("save_parameters", None)
+        return await self._target_form(user_input)
 
-    def _target_form(self, user_input: dict | None) -> ConfigFlowResult:
+    async def _target_form(self, user_input: dict | None) -> ConfigFlowResult:
         self._require_fresh()
-        tank_target = self._operation in ("edit_tank", "remove_tank")
+        tank_target = self._operation in ("edit_tank", "remove_tank", "tank_parameters")
         field = "tank_id" if tank_target else "zone_id"
         targets = {}
         registry = er.async_get(self.hass)
@@ -382,7 +555,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             return self.async_abort(reason="invalid_target")
         self._zone_index, self._tank_index, self._target_label = target
         if self._operation == "edit_zone":
-            return self._zone_form("rename_zone", None)
+            return await self._zone_form("rename_zone", None)
         if self._operation in ("add_tank", "edit_tank"):
             result = self._tank_form(None)
             assert result is not None
@@ -391,33 +564,38 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             return self.async_abort(reason="minimum_zones")
         if self._operation == "remove_tank" and len(self._zone["tanks"]) == 1:
             return self.async_abort(reason="minimum_tanks")
-        return self._confirm_remove(None)
+        return await self._confirm_remove(None)
 
     @property
     def _zone(self) -> Zone:
         return self._zones[self._zone_index]
 
     async def async_step_rename_zone(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._zone_form("rename_zone", user_input)
+        return await self._zone_form("rename_zone", user_input)
 
-    def _zone_form(self, step_id: str, user_input: dict | None) -> ConfigFlowResult:
+    async def _zone_form(self, step_id: str, user_input: dict | None) -> ConfigFlowResult:
         self._require_fresh()
         add = step_id == "add_zone"
         if add:
-            values, errors = self._level_suggestions.form_input(self.hass, user_input)
+            values, errors = self._binding_suggestions.form_input(self.hass, user_input)
         elif user_input is not None:
             values, errors = user_input, _field_errors(self.hass, user_input)
         else:
             values, errors = {"zone_name": self._zone["name"]}, {}
         if user_input is not None and not errors:
             if add:
-                self._zones.append(new_zone(er.async_get(self.hass), user_input))
+                proposed = self._zones + [new_zone(er.async_get(self.hass), user_input)]
+                errors = {field: error for (_, field), error in binding_errors(
+                    er.async_get(self.hass), self._original_zones, proposed).items()}
+                if not errors:
+                    self._zones = proposed
             else:
                 self._zone["name"] = user_input["zone_name"].strip()
-            return self._commit()
+            if not errors:
+                return await self._commit_owned_inventory() if self._owned else await self._commit_legacy_inventory()
         fields = _text_field("zone_name", values)
         if add:
-            self._level_suggestions.capture(er.async_get(self.hass), values)
+            self._binding_suggestions.capture(er.async_get(self.hass), values)
             fields.update(_tank_fields(values))
         return self.async_show_form(step_id=step_id, data_schema=vol.Schema(fields), errors=errors)
 
@@ -425,7 +603,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         result = self._tank_form(user_input)
         if result is not None:
             return result
-        return await self._commit_owned_tank() if self._owned else self._commit()
+        return await self._commit_owned_inventory() if self._owned else await self._commit_legacy_inventory()
 
     def _tank_form(self, user_input: dict | None) -> ConfigFlowResult | None:
         self._require_fresh()
@@ -438,33 +616,31 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         if defaults is not None:
             for role in ROLES:
                 field = f"{role}_switch"
-                if row_id := tank.get(f"{field}_registry_id"):
-                    row = registry.async_get(row_id)
-                    defaults[field] = row.entity_id if row else None
-        values, errors = self._level_suggestions.form_input(self.hass, user_input, defaults)
+                defaults[field] = binding_source(registry, tank, field)
+        values, errors = self._binding_suggestions.form_input(self.hass, user_input, defaults)
         manual = self._base_manual
+        manual_delta = {}
         if tank is not None and user_input is not None and not errors:
-            self._manual_delta, errors = self._commission(registry, tank, user_input, manual)
+            manual_delta, errors = self._commission(registry, tank, user_input, manual)
         if user_input is not None and not errors:
+            edited = new_tank(registry, user_input, tank["id"] if tank else None)
+            if tank is not None and "thresholds" in tank:
+                edited["thresholds"] = tank["thresholds"]
+            proposed = deepcopy(self._zones)
             if index is None:
-                self._zone["tanks"].append(new_tank(registry, user_input))
+                proposed[self._zone_index]["tanks"].append(edited)
             else:
-                edited = new_tank(registry, user_input, tank["id"])
-                if "thresholds" in tank:
-                    edited["thresholds"] = tank["thresholds"]
-                self._zone["tanks"][index] = edited
+                proposed[self._zone_index]["tanks"][index] = edited
+            errors = {field: error for (_, field), error in binding_errors(
+                registry, self._original_zones, proposed).items()}
+        if user_input is not None and not errors:
+            self._manual_delta = manual_delta
+            self._zones = proposed
             return None
         # Any rejected submission, including cutoff confirmation, can echo a
         # newly selected entity. Capture identities only once rendering is known.
-        self._level_suggestions.capture(registry, values)
-        if tank is not None:
-            for role in ROLES:
-                field = f"{role}_switch"
-                if ident := values.get(field):
-                    row = registry.async_get(ident)
-                    actual = row.id if row else None
-                    if self._shown_outputs.setdefault(ident, actual) != actual:
-                        values[field] = None
+        self._binding_suggestions.capture(registry, values)
+
         fields = _tank_fields(values)
         if tank is not None:
             for role in ROLES:
@@ -505,8 +681,7 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
             output = output_row(registry, entity_id)
             if output is None:
                 return {}, {field: "registered_output_required"}
-            if self._shown_outputs.get(entity_id, output.id) != output.id:
-                return {}, {field: "output_source_changed"}
+
             if output_conflicts(registry, zones, tank_id, role, output):
                 return {}, {field: "shared_output"}
             source_id = None
@@ -530,16 +705,16 @@ class WaterControlOptionsFlow(OptionsFlowWithReload):
         return {"manual": settings}, {}
 
     async def async_step_confirm_remove(self, user_input: dict | None = None) -> ConfigFlowResult:
-        return self._confirm_remove(user_input)
+        return await self._confirm_remove(user_input)
 
-    def _confirm_remove(self, user_input: dict | None) -> ConfigFlowResult:
+    async def _confirm_remove(self, user_input: dict | None) -> ConfigFlowResult:
         self._require_fresh()
         if user_input is not None and user_input["confirm"] is True:
             if self._tank_index is None:
                 del self._zones[self._zone_index]
             else:
                 del self._zone["tanks"][self._tank_index]
-            return self._commit()
+            return await self._commit_owned_inventory() if self._owned else await self._commit_legacy_inventory()
         return self.async_show_form(
             step_id="confirm_remove",
             description_placeholders={"target": self._target_label},

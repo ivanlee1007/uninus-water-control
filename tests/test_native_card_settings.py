@@ -101,8 +101,13 @@ class TestNativeCardSettings(SettingsFixture, IsolatedAsyncioTestCase):
         menu = await manager.async_init(self.entry.entry_id)
         self.assertNotIn("edit_thresholds", menu["menu_options"])
         self.assertNotIn("edit_display_scale", menu["menu_options"])
-        hint = await manager.async_configure(menu["flow_id"], {"next_step_id": "card_settings"})
-        self.assertEqual(hint["reason"], "card_settings_in_dashboard_editor")
+        # C navigation: native forms share the same Settings owner; the old
+        # dashboard-editor redirect is no longer the operational entry point.
+        self.assertIn("tank_parameters", menu["menu_options"])
+        hint = await manager.async_configure(menu["flow_id"], {"next_step_id": "common_parameters"})
+        self.assertEqual(hint["type"].value, "form")
+        self.assertEqual(hint["step_id"], "common_parameters")
+        manager.async_abort(hint["flow_id"])
         menu = await manager.async_init(self.entry.entry_id)
         target = await manager.async_configure(menu["flow_id"], {"next_step_id": "edit_zone"})
         rename = await manager.async_configure(target["flow_id"], {"zone_id": self.zone["id"]})
