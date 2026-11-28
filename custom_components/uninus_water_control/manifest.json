@@ -1,13 +1,22 @@
 {
   "domain": "uninus_water_control",
   "name": "Uninus Water Control",
-  "after_dependencies": ["http"],
-  "codeowners": ["@ivanlee1007"],
+  "after_dependencies": [
+    "http"
+  ],
+  "codeowners": [
+    "@ivanlee1007"
+  ],
   "config_flow": true,
-  "dependencies": ["sensor"],
+  "categories": [
+    "water"
+  ],
+  "dependencies": [
+    "sensor"
+  ],
   "documentation": "https://github.com/ivanlee1007/uninus-water-control",
   "integration_type": "hub",
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/ivanlee1007/uninus-water-control/issues",
-  "version": "0.3.0"
+  "version": "0.4.0"
 }

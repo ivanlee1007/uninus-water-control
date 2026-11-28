@@ -98,7 +98,7 @@ def test_native_card_contract_and_container_geometry(browser_page):
         stub: card.constructor.getStubConfig(), grid: card.getGridOptions(),
         count: customCards.filter((item) => item.type === card.localName).length,
     })""") == {
-        "stub": {"type": "custom:uninus-water-dashboard"},
+        "stub": {"type": "custom:uninus-water-dashboard", "display_mode": "thin"},
         "grid": {"columns": "full", "rows": "auto", "min_columns": 3},
         "count": 1,
     }
@@ -131,7 +131,7 @@ def test_native_card_contract_and_container_geometry(browser_page):
             assert geometry["tiles"][columns]["y"] >= first["y"] + first["height"]
         evidence.append(geometry)
 
-    for width, columns in ((300, 1), (344, 2), (512, 3), (692, 4)):
+    for width, columns in ((300, 1), (344, 1), (512, 2), (692, 3)):
         measure(width, columns)
         if evidence_dir and width in (300, 692):
             page.locator("#area").screenshot(path=Path(evidence_dir) / f"shell-light-{width}.png")
@@ -139,8 +139,8 @@ def test_native_card_contract_and_container_geometry(browser_page):
         card.hass = {...snapshot({...states, 'sensor.p6': projection(6, 2, 0)}), themes: {darkMode: true}};
     }""")
     page.locator(".tank").nth(5).wait_for()
-    measure(690, 4)
-    measure(740, 2, 2)
+    measure(690, 3)
+    measure(740, 3, 1)
     if evidence_dir:
         directory = Path(evidence_dir)
         page.locator("#area").screenshot(path=directory / "shell-dark-740.png")
@@ -200,7 +200,7 @@ def test_reference_inventory_fits_three_tanks_per_zone_at_desktop_width(browser_
         document.querySelector('#area').append(card);
     }""")
     page.locator(".tank").last.wait_for()
-    for width, expected in ((984, 3), (1030, 3), (1060, 3), (390, 2)):
+    for width, expected in ((984, 4), (1030, 4), (1060, 4), (390, 1)):
         rows = page.evaluate("""width => {
             document.querySelector('#area').style.width = `${width}px`;
             return [...card.shadowRoot.querySelectorAll('.zone')].map(zone => {
@@ -233,8 +233,8 @@ def test_calibrated_level_and_threshold_summary_follow_current_projection(browse
     meter.wait_for()
     assert meter.get_attribute("aria-valuenow") == "2.5"
     assert meter.get_attribute("aria-valuemax") == "2.5"
-    assert page.get_by_text("補水門檻　0.5／1.5 m", exact=True).is_visible()
-    assert page.get_by_text("低液位告警　≤ 0.4 m · 5 秒", exact=True).is_visible()
+    assert page.locator(".policy").get_by_text("補水門檻　0.5／1.5 m", exact=True).is_visible()
+    assert page.locator(".policy").get_by_text("低液位告警　≤ 0.4 m · 5 秒", exact=True).is_visible()
     assert page.get_by_text("超出顯示量程", exact=True).count() == 0
     page.evaluate("update('2.51')")
     assert meter.get_attribute("aria-valuenow") == "2.5"
@@ -246,7 +246,7 @@ def test_calibrated_level_and_threshold_summary_follow_current_projection(browse
     assert page.locator(".relation").get_by_text("液位讀值不可用", exact=True).is_visible()
     page.evaluate("update('1', {refill: [1.5, 0.5], version: 2})")
     assert meter.count() == 0
-    assert page.get_by_text("補水門檻　0.5／1.5 m", exact=True).count() == 0
+    assert page.locator(".policy").get_by_text("補水門檻　0.5／1.5 m", exact=True).count() == 0
 
 
 def test_mixed_thresholds_stay_on_their_own_validated_tanks(browser_page):
@@ -273,10 +273,11 @@ def test_mixed_thresholds_stay_on_their_own_validated_tanks(browser_page):
         assert tank.get_by_role("button", name="補水預覽無法取得", exact=True).is_disabled()
         assert tank.get_by_role("button", name="低液位告警預覽無法取得", exact=True).is_disabled()
     page.get_by_role("button", name="補水參數", exact=True).click()
+    parameters = page.get_by_role("region", name="補水參數", exact=True)
     for i in (1, 2):
-        assert page.get_by_text(f"補水門檻　{i}／{i+1} m", exact=True).is_visible()
-        assert page.get_by_text(f"低液位告警　≤ {i} m · 5 秒", exact=True).is_visible()
-    assert not page.get_by_text("補水門檻　3／4 m", exact=True).count()
+        assert parameters.get_by_text(f"補水門檻　{i}／{i+1} m", exact=True).is_visible()
+        assert parameters.get_by_text(f"低液位告警　≤ {i} m · 5 秒", exact=True).is_visible()
+    assert not page.locator(".tank").get_by_text("補水門檻　3／4 m", exact=True).count()
 
 
 def test_tank_readout_uses_a_vessel_without_claiming_a_measured_scale(browser_page):
@@ -495,7 +496,7 @@ def test_duplicate_labels_keep_distinct_tiles_through_resize_and_availability(br
     ]
     assert page.evaluate("""() => {
         const zones = [...card.shadowRoot.querySelectorAll('[data-zone-id]')];
-        return innerWidth === 1100 && zones[0].offsetLeft < zones[1].offsetLeft &&
+        return innerWidth === 1100 && zones[0].offsetTop < zones[1].offsetTop &&
             [...card.shadowRoot.querySelectorAll('.level')].every((tile, i) => tile === retained[i]) &&
             card.shadowRoot.activeElement === middleButton && blurs === 0;
     }""")
@@ -700,7 +701,7 @@ def test_approved_console_has_chinese_tabs_and_two_truthful_action_slots(browser
     assert tank.get_by_role("button", name="手動補水", exact=True).is_disabled()
     assert tank.get_by_role("button", name="開啟告警", exact=True).is_disabled()
     assert tank.get_by_text("補水輸出：未提供", exact=True).is_visible()
-    toggle = tank.get_by_role("button", name="未提供：詳細狀態", exact=True)
+    toggle = tank.get_by_role("button", name="詳細狀態", exact=True)
     assert toggle.get_attribute("aria-expanded") == "false"
     assert toggle.evaluate("b => b.parentElement.tagName === 'HEADER'")
     initial_height = tank.bounding_box()["height"]
@@ -930,3 +931,43 @@ def test_only_authoritative_output_cycle_retires_uncertainty_without_stop(remap_
     page.evaluate("publishStatus({})")
     assert start.is_visible() and start.is_enabled() and stop.is_hidden()
     assert page.evaluate("calls") == [manual_target("button.refill_start")]
+
+
+def test_display_mode_config_selects_thin_or_dense_rendering(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        window.states = Object.fromEntries([1, 2].map(n => [`sensor.p${n}`, projection(n)]));
+        window.card = normalCard();
+        card.setConfig(card.constructor.getStubConfig());
+        card.hass = snapshot(states);
+        document.querySelector('#area').append(card);
+    }""")
+    assert page.evaluate("card.dataset.mode") == "thin"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.thresholds')).display") != "none"
+    page.evaluate("card.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'dense'})")
+    assert page.evaluate("card.dataset.mode") == "dense"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.thresholds')).display") == "none"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.vessel')).display") == "none"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.commands')).display") == "flex"
+    page.evaluate("card.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'thin'})")
+    assert page.evaluate("card.dataset.mode") == "thin"
+    # Invalid values fall back to thin, never to a broken default.
+    page.evaluate("card.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'weird'})")
+    assert page.evaluate("card.dataset.mode") == "thin"
+
+
+def test_editor_display_mode_select_emits_card_config(browser_page):
+    page = browser_page
+    page.evaluate("""() => {
+        window.editor = document.createElement('uninus-water-dashboard-editor');
+        window.events = [];
+        window.editor.addEventListener('config-changed', (e) => window.events.push(e.detail.config));
+        document.body.appendChild(window.editor);
+        window.editor.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'thin'});
+    }""")
+    page.evaluate("document.getElementById('area').remove(); editor.shadowRoot.querySelector('select[data-mode-field=\"display_mode\"]').value = 'dense'")
+    page.evaluate("editor.shadowRoot.querySelector('select[data-mode-field=\"display_mode\"]').dispatchEvent(new Event('change', { bubbles: true }))")
+    assert page.evaluate("events[0]") == {"type": "custom:uninus-water-dashboard", "display_mode": "dense"}
+    # Re-selecting the current mode emits nothing.
+    page.evaluate("editor.shadowRoot.querySelector('select[data-mode-field=\"display_mode\"]').dispatchEvent(new Event('change', { bubbles: true }))")
+    assert page.evaluate("events.length") == 1

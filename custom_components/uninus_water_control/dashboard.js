@@ -45,99 +45,173 @@ const UNAVAILABLE = "液位讀值不可用";
 const STYLE = `
   :host { display:block; min-width:0; }
   .shell {
-    container: water-console / inline-size; padding:14px; border-radius:13px;
-    --bg:#eef4f9; --card:#fff; --tint:#f7fafc; --ink:#143047; --muted:#4f6477; --line:#cddce7;
-    --accent:#075f92; --accent-bg:#dceffc; --good:#086352; --good-bg:#d9f4ed;
-    --high:#8e2827; --high-bg:#fde5e1; --low:#174e8b; --low-bg:#e1edff;
-    --neutral:#425568; --neutral-bg:#e8eef3; --wait:#70420f; --wait-bg:#f9ecd8;
-    background:var(--bg); color:var(--ink); font:14px/1.45 system-ui,'Microsoft JhengHei',sans-serif;
+    container: water-console / inline-size;
+    --bg:#f4f6fa; --card:#ffffff; --tint:#eef1f7; --ink:#191f2a;
+    --muted:#4e5866; --faint:#8b93a1; --line:#dfe3ec;
+    --accent:#03a9f4; --accent-deep:#025f7c; --accent-bg:#e1f3fd; --accent-ink:#025d7c;
+    --good:#2e7d32; --good-bg:#e0f2ec; --warn:#ef6c0a; --warn-bg:#fff0e1;
+    --bad:#d32f2f; --bad-bg:#fbe6e6; --neutral:#4e5866; --neutral-bg:#edf0f6;
+    padding:14px 15px 16px; border-radius:14px;
+    background:var(--bg); color:var(--ink);
+    box-shadow:0 1px 3px rgba(16,24,40,.08), 0 6px 18px rgba(16,24,40,.06);
+    font:14px/1.5 var(--ha-font,system-ui,'Microsoft JhengHei','PingFang TC',sans-serif);
   }
   .shell[data-dark] {
-    --bg:#17232e; --card:#243442; --tint:#1d2b38; --ink:#e3eff9; --muted:#b5c7d8; --line:#496173;
-    --accent:#15638d; --accent-bg:#25435c; --good:#b3efdc; --good-bg:#274c47;
-    --high:#ffd1ca; --high-bg:#623635; --low:#c3deff; --low-bg:#294563;
-    --neutral:#d2e3f0; --neutral-bg:#354859; --wait:#ffe0aa; --wait-bg:#574127;
+    --bg:#0f1218; --card:#171b24; --tint:#1c2330; --ink:#e8ebf1;
+    --muted:#aeb6c4; --faint:#6d7686; --line:#262c38;
+    --accent:#38b6fc; --accent-deep:#0b77a3; --accent-bg:#16314a; --accent-ink:#9adcff;
+    --good:#6fdc93; --good-bg:#173227; --warn:#ffb26b; --warn-bg:#3d2917;
+    --bad:#ff8f8a; --bad-bg:#3a1d1d; --neutral:#c6cdd8; --neutral-bg:#222c3d;
+    box-shadow:0 1px 3px rgba(0,0,0,.5), 0 6px 18px rgba(0,0,0,.4);
   }
   *, *::before, *::after { box-sizing:border-box; }
   [hidden] { display:none !important; }
   h1,h2,h3,p { margin:0; }
-  h1 { font-size:25px; line-height:1.17; }
-  h2 { font-size:17px; }
-  h3 { font-size:15px; }
+  .dim { color:var(--muted); font-size:12px; }
+  .flex { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   button,.options-link {
-    font:inherit; color:var(--ink); min-width:0; min-height:44px; padding:5px 11px;
+    font:inherit; color:var(--ink); min-width:0; min-height:44px; padding:5px 12px;
     background:var(--card); border:1px solid var(--line); border-radius:9px;
-    font-weight:700; cursor:pointer;
+    font-weight:600; cursor:pointer; text-decoration:none;
   }
   button:not(:disabled):hover,.options-link:hover { border-color:var(--accent); }
-  button:disabled { cursor:not-allowed; color:var(--muted); background:var(--tint); border-style:dashed; }
-  :focus-visible { outline:2px solid var(--low); outline-offset:2px; }
-  .flex,.policy,.readout { display:flex; align-items:center; gap:8px; justify-content:space-between; flex-wrap:wrap; }
-  .pagehead { margin-bottom:10px; }
-  .tabs { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:8px 0; }
-  .tabs button[aria-pressed=true],.options-link { background:var(--accent); border-color:var(--accent); color:white; }
-  .dim { color:var(--muted); font-size:12px; }
-  .policy,.zone,.formbox { background:var(--card); border:1px solid var(--line); border-radius:13px; padding:10px; }
-  .policy { justify-content:flex-start; gap:8px 16px; margin-bottom:10px; }
-  .policy b { overflow-wrap:anywhere; }
-  .pill { font-size:12px; line-height:1.3; font-weight:750; padding:4px 7px; border-radius:999px;
-    background:var(--neutral-bg); color:var(--neutral); overflow-wrap:anywhere; }
+  button:disabled { cursor:not-allowed; color:var(--faint); background:var(--tint); border-style:dashed; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  .pagehead { display:flex; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+  .pagehead .ph-title { min-width:0; }
+  .pagehead h1 { font-size:1.4rem; font-weight:700; letter-spacing:.01em; }
+  .pagehead .sub { font-size:.7rem; font-weight:600; color:var(--faint); letter-spacing:.07em; text-transform:uppercase; margin-top:3px; }
+  .global-pill {
+    margin-left:auto; align-self:center; font-size:.78rem; font-weight:700; padding:6px 14px;
+    border-radius:999px; background:var(--neutral-bg); color:var(--neutral); white-space:nowrap;
+  }
+  .global-pill.good { background:var(--good-bg); color:var(--good); }
+  .global-pill.warn { background:var(--warn-bg); color:var(--warn); }
+  .global-pill.bad { background:var(--bad-bg); color:var(--bad); }
+  .count { color:var(--faint); font-size:.78rem; margin-top:4px; }
+
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin:12px 0 2px; padding-bottom:10px; border-bottom:1px solid var(--line); }
+  .tabs button { min-height:38px; font-size:.9rem; font-weight:600; color:var(--muted);
+    background:transparent; border:1px solid transparent; border-radius:999px; padding:6px 14px; }
+  .tabs button:hover { color:var(--ink); background:var(--tint); }
+  .tabs button[aria-pressed="true"] { color:var(--accent-ink); background:var(--accent-bg);
+    border-color:color-mix(in srgb, var(--accent) 42%, transparent); }
+
+  .policy { display:flex; align-items:center; gap:8px 14px; flex-wrap:wrap; margin-top:11px;
+    font-size:.8rem; color:var(--muted); background:var(--card);
+    border:1px solid var(--line); border-radius:11px; padding:9px 12px; }
+  .policy b { color:var(--ink); font-weight:650; }
+  .policy .sep { color:var(--faint); }
+  .notice { margin-top:11px; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:8px 10px; }
+
+  .zones { display:grid; grid-template-columns:1fr; gap:16px; margin-top:14px; align-items:start; }
+  .zone { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px 13px 13px; min-width:0; }
+  .zone-head { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; }
+  .zone-head h2 { font-size:1.02rem; font-weight:650; overflow-wrap:anywhere; }
+  .zone-head .count { color:var(--faint); font-size:.72rem; white-space:nowrap; }
+  .zone-head .pill { margin-left:auto; }
+  .pill { font-size:.72rem; font-weight:700; padding:3px 10px; border-radius:999px;
+    background:var(--neutral-bg); color:var(--neutral); white-space:normal; overflow-wrap:anywhere; }
+  .pill.high { background:var(--bad-bg); color:var(--bad); }
+  .pill.wait { background:var(--warn-bg); color:var(--warn); }
   .pill.good { background:var(--good-bg); color:var(--good); }
-  .pill.high,.commands .stop:not(:disabled) { background:var(--high-bg); color:var(--high); }
-  .pill.wait { background:var(--wait-bg); color:var(--wait); }
-  .notice { background:var(--card); border:1px solid var(--line); border-radius:9px; padding:8px 10px; }
-  .zones,.editor-split { display:grid; gap:10px; align-items:start; }
-  .alarm-history { margin-top:12px; }
-  .alarm-history-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .alarm-history select { max-width:100%; color:var(--primary-text-color); background:var(--card-background-color); }
-  .alarm-history ol { padding-inline-start:1.5em; }
-  .alarm-history li { margin-block:4px; overflow-wrap:anywhere; }
-  .zones { grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); }
-  .zone-head { margin-bottom:8px; }
-  .tanks { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,138px),1fr)); gap:7px; }
-  .tank { background:var(--tint); border:1px solid var(--line); border-radius:10px; padding:8px; min-width:0; }
-  .tank .flex { gap:4px; }
-  h2,h3,.settings-row,.diagnostics,.manual-dialog { overflow-wrap:anywhere; }
-  .readout { justify-content:flex-start; flex-wrap:nowrap; margin:7px 0; }
-  .level {
-    flex:1; display:block; min-width:0; text-align:start; padding:0;
-    min-height:44px; border:0; border-radius:5px; background:transparent;
-  }
-  .level:hover .value { text-decoration:underline; }
-  .vessel { display:grid; align-items:end; overflow:hidden; width:25px; height:34px; flex:none;
-    border:1px solid #6191ac; border-radius:5px; background:var(--accent-bg); }
-  .water { width:100%; background:#328fc6; }
-  .reading { min-width:0; font-size:23px; font-weight:850; letter-spacing:-.045em; line-height:1.1; }
-  .value { overflow-wrap:anywhere; }
-  .reading small { font-size:12px; letter-spacing:0; font-weight:700; color:var(--muted); margin-left:2px; }
-  .relation { display:block; font-weight:600; letter-spacing:0; margin-top:3px; overflow-wrap:anywhere; }
-  .info { display:grid; align-content:start; min-height:34px; line-height:1.25; font-size:12px; margin-bottom:6px; gap:2px; }
-  .commands { display:grid; gap:4px; }
-  .commands button { width:100%; padding-inline:4px; }
-  .diagnostics-toggle { min-height:0; border:0; }
-  .diagnostics-toggle::after { content:'▾' / ''; margin-inline-start:3px; }
-  .diagnostics-toggle[aria-expanded=true]::after { content:'▴' / ''; }
-  .diagnostics-toggle:hover { text-decoration:underline; }
-  .diagnostics { display:grid; gap:4px; margin-top:6px; font-size:12px; }
-  .diagnostics button { width:100%; text-align:start; padding-inline:5px; }
-  .manual-fault,.range-warning { color:var(--high); font-weight:700; }
-  .manual-message:empty,.manual-fault:empty,.manual-pending:empty { display:none; }
-  .manual-dialog {
-    position:static; width:100%; max-width:none; margin:6px 0 0; padding:8px;
-    border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--ink);
-  }
-  .manual-dialog p { margin:4px 0; }
-  .manual-dialog-actions { display:flex; flex-wrap:wrap; justify-content:end; gap:4px; }
-  .formbox { display:grid; gap:10px; }
+  .tanks { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr)); gap:12px; align-items:stretch; }
+
+  .tank { background:var(--tint); border:1px solid var(--line); border-radius:12px; padding:11px 12px 12px;
+    display:grid; grid-template-columns:1fr; gap:9px; min-width:0;
+    transition:border-color .18s ease, background .18s ease; }
+  .tank.low { border-color:color-mix(in srgb, var(--bad) 55%, transparent);
+    background:color-mix(in srgb, var(--bad) 7%, var(--tint)); }
+  .tank .tank-head { display:flex; align-items:flex-start; gap:8px; min-width:0; }
+  .tank h3 { font-size:.95rem; font-weight:700; line-height:1.3; overflow-wrap:anywhere; }
+  .phase-chip { flex:none; font-size:.7rem; font-weight:700; letter-spacing:.03em;
+    padding:3px 9px; border-radius:999px; background:var(--neutral-bg); color:var(--neutral); white-space:nowrap; }
+  .phase-chip.good { background:var(--good-bg); color:var(--good); }
+  .phase-chip.high { background:var(--bad-bg); color:var(--bad); }
+  .phase-chip.wait { background:var(--warn-bg); color:var(--warn); }
+  .diagnostics-toggle { margin-left:auto; flex:none; min-width:0; min-height:0; padding:2px 8px; font-size:.72rem;
+    line-height:1.7; border-radius:7px; border:1px solid transparent; background:transparent; color:var(--muted); }
+  .diagnostics-toggle:hover { border-color:var(--line); }
+  .diagnostics-toggle::after { content:'▾'; }
+  .diagnostics-toggle[aria-expanded="true"]::after { content:'▴'; }
+  .measure { display:flex; gap:13px; align-items:stretch; min-width:0; }
+  .vessel { position:relative; display:grid; align-items:end; overflow:hidden; flex:none;
+    width:44px; min-height:82px; padding:0; border:1.5px solid color-mix(in srgb, var(--accent) 42%, var(--line));
+    border-radius:8px; background:var(--accent-bg); }
+  .vessel .water { width:100%; min-height:0; background:linear-gradient(180deg, var(--accent), var(--accent-deep));
+    transition:height .55s cubic-bezier(.2,.7,.3,1); }
+  .level { display:block; min-width:0; flex:1; text-align:start; padding:0; min-height:0;
+    border:0; background:transparent; }
+  .reading { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:center; gap:3px 5px; min-width:0; }
+  .reading .relation { flex-basis:100%; margin-top:2px; }
+  .reading .value { font-size:1.55rem; font-weight:750; letter-spacing:-.03em; line-height:1.1;
+    font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  .reading small { font-size:.75rem; font-weight:600; color:var(--faint); margin-left:3px; }
+  .relation { font-size:.74rem; font-weight:600; color:var(--muted); overflow-wrap:anywhere; }
+  .thresholds { display:grid; gap:3px; padding:7px 9px; border-radius:8px;
+    background:var(--card); border:1px solid var(--line); font-size:.72rem; color:var(--muted); }
+  .thresholds .row { display:flex; justify-content:space-between; gap:10px; overflow-wrap:anywhere; }
+  .thresholds .key { font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--faint); font-size:.64rem; }
+  .info { display:grid; gap:3px; align-content:start; font-size:.75rem; line-height:1.3; color:var(--muted); }
+  .commands { display:grid; gap:6px; align-content:start; }
+  .commands .action-slot { display:contents; }
+  .commands button { width:100%; min-height:40px; font-size:.78rem; font-weight:700; padding:8px 10px; border-radius:9px; }
+  .commands button.stop { color:var(--bad);
+    border-color:color-mix(in srgb, var(--bad) 45%, transparent);
+    background:color-mix(in srgb, var(--bad) 13%, var(--card)); }
+  .commands button:not(.stop):not(:disabled) { color:#fff; background:var(--accent); border-color:var(--accent); }
+  .range-warning { color:var(--bad); font-weight:700; font-size:.74rem; }
+  .manual-pending,.manual-fault,.manual-message { font-size:.74rem; font-weight:650; }
+  .manual-pending:empty,.manual-fault:empty,.manual-message:empty { display:none; }
+  .manual-fault { color:var(--bad); }
+  .diagnostics { display:grid; gap:5px; margin-top:2px; font-size:.75rem; padding-top:8px; border-top:1px solid var(--line); }
+  .diagnostics button { width:100%; text-align:start; padding-inline:6px; min-height:0; }
+  .diagnostics .status-line { display:grid; gap:2px; }
+  .diagnostics .status-line strong { font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); }
+  .manual-dialog { position:static; width:100%; max-width:none; margin:6px 0 0; padding:9px;
+    border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--ink); }
+  .manual-dialog p { margin:4px 0; font-size:.83rem; }
+  .manual-dialog-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; margin-top:8px; }
+
+  .formbox { display:grid; gap:10px; background:var(--card); border:1px solid var(--line); border-radius:13px; padding:12px; margin-top:14px; }
+  .formbox h2 { font-size:1.05rem; }
+  .editor-split { display:grid; gap:10px; align-items:start; }
   .editor-zone,.settings-row { border-top:1px solid var(--line); padding-top:8px; }
   .editor-zone { display:grid; gap:8px; }
-  .options-link { display:inline-flex; align-items:center; text-decoration:none; }
+  .options-link { display:inline-flex; align-items:center; color:var(--accent-ink); font-weight:650; }
+  .alarm-history-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .alarm-history ol { padding-inline-start:1.5em; margin-top:6px; }
+  .alarm-history li { margin-block:4px; overflow-wrap:anywhere; }
+
+  .shell[data-mode="dense"] .shell { padding:10px 10px 12px; }
+  .shell[data-mode="dense"] .zones { grid-template-columns:1fr; gap:12px; margin-top:11px; }
+  .shell[data-mode="dense"] .zone { padding:9px 10px 10px; border-radius:11px; }
+  .shell[data-mode="dense"] .zone-head { margin-bottom:8px; }
+  .shell[data-mode="dense"] .tanks { grid-template-columns:1fr; gap:7px; }
+  .shell[data-mode="dense"] .tank { display:flex; flex-wrap:wrap; align-items:center; gap:6px 12px; padding:8px 10px; border-radius:10px; }
+  .shell[data-mode="dense"] .tank .tank-head { flex:1 1 160px; min-width:110px; }
+  .shell[data-mode="dense"] .tank h3 { font-size:.85rem; }
+  .shell[data-mode="dense"] .phase-chip { font-size:.64rem; padding:2px 8px; }
+  .shell[data-mode="dense"] .measure { flex:0 0 auto; gap:9px; align-items:center; }
+  .shell[data-mode="dense"] .vessel { display:none; }
+  .shell[data-mode="dense"] .level { min-height:0; }
+  .shell[data-mode="dense"] .reading { flex-direction:row; flex-wrap:nowrap; align-items:baseline; gap:4px; }
+  .shell[data-mode="dense"] .reading .relation { flex-basis:auto; margin-top:0; }
+  .shell[data-mode="dense"] .reading .value { font-size:1.05rem; }
+  .shell[data-mode="dense"] .reading small { font-size:.7rem; }
+  .shell[data-mode="dense"] .relation { font-size:.68rem; line-height:1.2; }
+  .shell[data-mode="dense"] .thresholds, .shell[data-mode="dense"] .info { display:none; }
+  .shell[data-mode="dense"] .commands { display:flex; flex-wrap:wrap; gap:6px; margin-left:auto; flex:0 0 auto; }
+  .shell[data-mode="dense"] .commands button { width:auto; flex:0 0 auto; min-height:32px; min-width:38px; font-size:.72rem; padding:6px 8px; }
+  .shell[data-mode="dense"] .diagnostics { flex-basis:100%; }
+  .shell[data-mode="dense"] .range-warning { flex-basis:100%; }
+
   @container water-console (max-width:480px) {
+    .shell { padding:11px 10px 13px; }
     button { font-size:13px; }
-    .policy { gap:5px 10px; }
-    .tank .pill { font-size:11px; }
-    .tank h3 { font-size:14px; }
-    .tank .flex { justify-content:flex-start; }
+    .pagehead h1 { font-size:1.2rem; }
+    .global-pill { margin-left:0; width:100%; text-align:center; }
   }
   @container water-console (min-width:750px) {
     .editor-split { grid-template-columns:repeat(2,minmax(0,1fr)); }
@@ -212,7 +286,14 @@ function relationText(depth, display, refill, alarm) {
   if (display.refill && refill === "refill_threshold" && depth.value < display.refill[0]) return "↓ 低於補水門檻";
   if (refill && refill !== "unavailable") return REFILL_LABEL[refill];
   if (alarm === "on") return "低液位告警中";
-  return display.refill || refill ? REFILL_LABEL.unavailable : "補水門檻未設定";
+  // Preview unavailable: still report the raw threshold relationship when
+  // the display metadata is known, rather than hiding the comparison.
+  if (display.refill) {
+    if (depth.value < display.refill[0]) return `↓ 低於下限 (${display.refill[0]} m)`;
+    if (depth.value > display.refill[1]) return `↑ 高於上限 (${display.refill[1]} m)`;
+    return `水位在上下門檻內 (${display.refill[0]} – ${display.refill[1]} m)`;
+  }
+  return refill ? REFILL_LABEL.unavailable : "補水門檻未設定";
 }
 
 function validStatus(state, status) {
@@ -418,6 +499,7 @@ class UninusWaterDashboard extends HTMLElement {
   #layout;
   #notice;
   #overview;
+  #global;
   #shell;
   #views = new Map();
   #view = "overview";
@@ -442,16 +524,21 @@ class UninusWaterDashboard extends HTMLElement {
     style.textContent = STYLE;
     this.#shell = element("div", "shell");
     this.#shell.lang = "zh-Hant";
-    const head = element("header", "pagehead flex");
-    const heading = element("div");
+    const head = element("header", "pagehead");
+    const heading = element("div", "ph-title");
     const title = element("h1");
-    const count = element("p", "dim");
+    const sub = element("div", "sub");
+    const count = element("p", "count");
     text(title, "補水控制");
-    heading.append(title, count);
+    text(sub, "UNiNUS Water Control");
+    heading.append(title, sub, count);
+    const globalPill = element("span", "global-pill good");
+    head.append(heading, globalPill);
+    this.#shell.append(head);
     const nav = element("nav", "tabs");
     nav.setAttribute("aria-label", "補水頁面");
-    head.append(heading, nav);
-    this.#shell.append(head);
+    this.#shell.append(nav);
+    this.#global = globalPill;
     for (const [key, name] of Object.entries(VIEWS)) {
       const tab = button();
       const section = element("section");
@@ -474,7 +561,7 @@ class UninusWaterDashboard extends HTMLElement {
     const alarm = element("b");
     summary.append(refill, separator, alarm);
     this.#views.get("overview").section.append(summary, this.#notice, this.#layout);
-    this.#overview = { count, summary, refill, alarm };
+    this.#overview = { count, summary, refill, alarm, global: globalPill };
     for (const [key, titleText, linkText, help] of [
       ["parameters", "各桶門檻與顯示量程", null,
         "此處僅顯示已套用的參數。管理員可在「編輯儀表板 → 編輯補水卡片」調整；門檻預覽不操作設備。"],
@@ -518,7 +605,7 @@ class UninusWaterDashboard extends HTMLElement {
   }
 
   static getStubConfig() {
-    return { type: `custom:${TAG}` };
+    return { type: `custom:${TAG}`, display_mode: "thin" };
   }
 
   static getConfigElement() {
@@ -563,10 +650,15 @@ class UninusWaterDashboard extends HTMLElement {
     return Math.max(1, Math.ceil(this.offsetHeight / 50));
   }
 
+  // The display mode comes from the card's own Lovelace config (set in the
+  // card editor), not from integration settings or any backend write. A mode
+  // change must re-render, even after the first successful setConfig.
   setConfig(config) {
-    if (config?.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
-    if (this.#configured) return;
-    this.#configured = true;
+    if (!config || config.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
+    this.config = { ...config, display_mode: config.display_mode === "dense" ? "dense" : "thin" };
+    this.dataset.mode = this.config.display_mode;
+    this.#shell.dataset.mode = this.config.display_mode;
+    if (!this.#configured) this.#configured = true;
     this.#render();
   }
 
@@ -1027,37 +1119,51 @@ class UninusWaterDashboard extends HTMLElement {
   #newTank(tank) {
     const host = element("article", "tank");
     host.dataset.tankId = tank.id;
-    const header = element("header", "flex");
+    const header = element("header", "tank-head");
     const title = element("h3");
-    const pill = button("pill diagnostics-toggle");
-    header.append(title, pill);
-    const measurement = element("div", "readout");
-    const readout = button("level");
+    const phaseChip = element("span", "phase-chip");
+    const detailsToggle = button("diagnostics-toggle");
+    detailsToggle.setAttribute("aria-label", "詳細狀態");
+    header.append(title, phaseChip, detailsToggle);
+    const measure = element("div", "measure");
     const vessel = element("span", "vessel");
     vessel.setAttribute("role", "meter");
     vessel.setAttribute("aria-valuemin", "0");
     const water = element("span", "water");
     vessel.append(water);
+    const readout = button("level");
     const reading = element("span", "reading");
     const value = element("span", "value");
     const unit = element("small");
     text(unit, " m");
-    const relation = element("span", "dim relation");
+    const relation = element("span", "relation dim");
     reading.append(value, unit, relation);
     readout.append(reading);
-    measurement.append(vessel, readout);
+    measure.append(vessel, readout);
+    const thresholds = element("div", "thresholds");
+    const refillRow = element("div", "row");
+    const refillKey = element("span", "key");
+    text(refillKey, "補水");
+    const refillVal = element("span");
+    refillRow.append(refillKey, refillVal);
+    const alarmRow = element("div", "row");
+    const alarmKey = element("span", "key");
+    text(alarmKey, "告警");
+    const alarmVal = element("span");
+    alarmRow.append(alarmKey, alarmVal);
+    thresholds.append(refillRow, alarmRow);
     const rangeMessage = element("p", "dim range-warning");
     const info = element("div", "info");
     const commands = element("div", "commands");
     const diagnostics = element("div", "diagnostics");
     diagnostics.id = `details-${tank.id}`;
     diagnostics.hidden = true;
-    pill.title = "詳細狀態";
-    pill.setAttribute("aria-controls", diagnostics.id);
-    pill.setAttribute("aria-expanded", "false");
-    pill.addEventListener("click", () => {
+    detailsToggle.title = "詳細狀態";
+    detailsToggle.setAttribute("aria-controls", diagnostics.id);
+    detailsToggle.setAttribute("aria-expanded", "false");
+    detailsToggle.addEventListener("click", () => {
       diagnostics.hidden = !diagnostics.hidden;
-      pill.setAttribute("aria-expanded", String(!diagnostics.hidden));
+      detailsToggle.setAttribute("aria-expanded", String(!diagnostics.hidden));
     });
     const range = element("p", "dim");
     const previewRows = new Map([...PREVIEW_TYPES.keys()].map((kind) => {
@@ -1065,8 +1171,9 @@ class UninusWaterDashboard extends HTMLElement {
       node.addEventListener("click", () => moreInfo(node, node.dataset.entity));
       return [kind, node];
     }));
-    host.append(header, measurement, rangeMessage, info, commands, diagnostics);
-    const slot = { host, title, pill, readout, vessel, water, value, unit, relation, range, rangeMessage, previewRows };
+    host.append(header, measure, thresholds, rangeMessage, info, commands, diagnostics);
+    const slot = { host, title, phaseChip, detailsToggle, readout, vessel, water, value, unit, relation,
+      thresholds: { refillVal, alarmVal }, range, rangeMessage, previewRows };
     readout.addEventListener("click", () => moreInfo(readout, slot.entity));
     const roles = new Map();
     for (const role of ROLES) roles.set(role, this.#newPanel(tank.id, role, slot));
@@ -1079,6 +1186,9 @@ class UninusWaterDashboard extends HTMLElement {
 
   #render() {
     if (!this.isConnected || !this.#configured) return;
+    const mode = this.config?.display_mode === "dense" ? "dense" : "thin";
+    this.dataset.mode = mode;
+    this.#shell.dataset.mode = mode;
     const states = this.#hass?.states;
     this.#shell.toggleAttribute("data-dark", this.#hass?.themes?.darkMode === true);
     for (const { link } of this.#views.values()) if (link) link.hidden = this.#hass?.user?.is_admin !== true;
@@ -1096,6 +1206,7 @@ class UninusWaterDashboard extends HTMLElement {
     const displays = new Map(zones.flatMap((zone) => zone.tanks.map(({ id, entity }) => [id, displayFrom(entity, states[entity])])));
     const nextPanels = new Map();
     const nextZones = new Map();
+    const globalCounts = { running: 0, pending: 0, low: 0, unchecked: 0 };
     for (const zone of zones) {
       let current = this.#zones.get(zone.id);
       if (!current) {
@@ -1135,6 +1246,9 @@ class UninusWaterDashboard extends HTMLElement {
         updateGauge(slot, depth, display.scale);
         text(slot.relation, relationText(depth, display, band, low));
         slot.host.toggleAttribute("data-low-level-active", low === "on");
+        slot.host.classList.toggle("low", low === "on");
+        text(slot.thresholds.refillVal, display.refill ? refillText(display.refill) : "補水門檻未設定");
+        text(slot.thresholds.alarmVal, display.alarm ? alarmText(display.alarm) : "低液位告警未設定");
         for (const [kind, control] of slot.previewRows) {
           const entity = available?.get(kind);
           const isRefill = kind === "refill_preview";
@@ -1159,15 +1273,19 @@ class UninusWaterDashboard extends HTMLElement {
         reports.push(alarmBinding ? alarm?.actual ?? "unknown" : undefined);
         const refillPanel = slot.roles.get("refill");
         const commissioned = refillPanel.key !== undefined;
+        const refillStatus = refill;
+        if (refillStatus?.actual === "on" || refillStatus?.phase === "running" || refillStatus?.phase === "starting") globalCounts.running++;
+        if (refillPanel.startWait || refillStatus?.pending_on || refillStatus?.pending_off || refillStatus?.phase === "starting") globalCounts.pending++;
+        if (low === "on") globalCounts.low++;
+        else if (low !== "off") globalCounts.unchecked++;
         const pill = refill ? refill.phase === "running" && refill.actual === "on" ? "補水中" :
           refill.phase === "idle" && refill.actual === "unknown" ? "輸出未知" :
             refill.phase === "idle" && refillPanel.startWait ? "等候回報" : PHASE_LABEL[refill.phase] :
           commissioned ? "回報未知" : "未提供";
-        text(slot.pill, pill);
-        slot.pill.setAttribute("aria-label", `${pill}：詳細狀態`);
-        slot.pill.classList.toggle("good", pill === "補水中");
-        slot.pill.classList.toggle("high", refill?.phase === "fault");
-        slot.pill.classList.toggle("wait", !!(refillPanel.startWait || refill?.pending_on || refill?.pending_off));
+        text(slot.phaseChip, pill);
+        slot.phaseChip.classList.toggle("good", pill === "補水中");
+        slot.phaseChip.classList.toggle("high", refill?.phase === "fault");
+        slot.phaseChip.classList.toggle("wait", !!(refillPanel.startWait || refill?.pending_on || refill?.pending_off));
       }
       text(current.pill, zoneReport(reports));
       current.pill.classList.toggle("high", reports.includes("on"));
@@ -1184,8 +1302,18 @@ class UninusWaterDashboard extends HTMLElement {
       const { tankId, role } = interlock.flight;
       if (!nextPanels.get(tankId)?.has(role)) interlock.sawActivity = false;
     }
-    const { count, summary, refill, alarm } = this.#overview;
+    const { count, summary, refill, alarm, global: globalPill } = this.#overview;
     text(count, `${zones.length} 區 · ${displays.size} 桶 · 水位單位 m`);
+    // An unreported alarm is not a confirmed-safe one: do not claim all is well.
+    let gClass = "good";
+    let gLabel = "全部正常";
+    if (globalCounts.low > 0) { gClass = "bad"; gLabel = `告警中 ${globalCounts.low} 桶`; }
+    else if (globalCounts.pending > 0) { gClass = "warn"; gLabel = "等候回報"; }
+    else if (globalCounts.running > 0) { gClass = "warn"; gLabel = `運轉中 ${globalCounts.running} 桶`; }
+    else if (globalCounts.unchecked > 0) { gClass = "warn"; gLabel = "部分回報未取得"; }
+    text(globalPill, gLabel);
+    globalPill.classList.remove("good", "warn", "bad");
+    globalPill.classList.add(gClass);
     const all = [...displays.values()];
     const waterPolicy = uniformPair(all, "refill");
     const alarmPolicy = uniformPair(all, "alarm");
@@ -1405,7 +1533,9 @@ const EDITOR_CSS = `
   h2 { font-size:1.15rem; }
   h3 { font-size:1rem; }
   h4 { font-size:.95rem; }
-  .section,.tank-settings,.shared,.apply-strip { min-width:0; border-radius:12px; padding:12px; display:grid; gap:10px; }
+  .section,.tank-settings,.shared,.apply-strip,.mode-section { min-width:0; border-radius:12px; padding:12px; display:grid; gap:10px; }
+  .mode-section { background:var(--card-background-color,#fff); border:1px solid var(--divider-color,#cddce7); }
+  .mode-section h2 { font-size:1rem; }
   .section { background:var(--secondary-background-color,#eef4f9); }
   .shared,.tank-settings,.apply-strip { background:var(--card-background-color,#fff); border:1px solid var(--divider-color,#cddce7); }
   .apply-strip { position:sticky; top:0; z-index:1; }
@@ -1563,6 +1693,10 @@ class UninusWaterDashboardEditor extends HTMLElement {
   #apply;
   #openInventory;
   #topology;
+  #modeSection;
+  #mode;
+  #modeSelect;
+  #config;
 
   constructor() {
     super();
@@ -1572,6 +1706,34 @@ class UninusWaterDashboardEditor extends HTMLElement {
     const shell = element("div", "settings editor-content");
     shell.lang = "zh-Hant";
     this.#content = element("div", "editor-content");
+    // Card-local display mode. This is a pure Lovelace card setting: it never
+    // touches integration settings, Core, or physical outputs.
+    this.#modeSection = element("section", "mode-section");
+    const modeTitle = element("h2");
+    text(modeTitle, "顯示模式");
+    const modeNote = element("p", "dim");
+    text(modeNote, "只影響本卡片的呈現，不會改變整合設定或任何控制。");
+    const modeSelect = element("select");
+    modeSelect.setAttribute("aria-label", "卡片顯示模式");
+    modeSelect.dataset.modeField = "display_mode";
+    for (const [value, caption, help] of [
+      ["thin", "細型自訂卡片（B 模式）", "水位 gauge、狀態徽章與門檻資訊，適合獨立檢視"],
+      ["dense", "濃縮運行面板（C 模式）", "緊密多欄、高掃描率，適合密集監看"],
+    ]) {
+      const option = element("option");
+      option.value = value;
+      text(option, caption);
+      option.title = help;
+      modeSelect.append(option);
+    }
+    modeSelect.addEventListener("change", () => {
+      const mode = modeSelect.value === "dense" ? "dense" : "thin";
+      if (this.#mode !== undefined && mode === this.#mode) return;
+      this.#mode = mode;
+      this._persistMode(mode);
+    });
+    this.#modeSelect = modeSelect;
+    this.#modeSection.append(modeTitle, modeNote, labeledControl("顯示模式", modeSelect));
     const onDraft = () => {
       if (this.#status.textContent === APPLIED) text(this.#status, "");
       this.#updateDraft();
@@ -1609,15 +1771,25 @@ class UninusWaterDashboardEditor extends HTMLElement {
     this.#openInventory.addEventListener("click", (event) => { if (event.isTrusted) void this.#openTopology(); });
     actions.append(this.#apply, this.#openInventory, this.#review, this.#reload);
     footer.append(info, this.#impact, this.#impactList, this.#status, actions);
-    shell.append(footer, this.#currentValues, this.#content);
+    shell.append(this.#modeSection, footer, this.#currentValues, this.#content);
     root.append(css, shell);
   }
 
   setConfig(config) {
     if (config?.type !== `custom:${TAG}`) throw new Error(`Expected custom:${TAG}`);
+    this.#config = { ...config, display_mode: config.display_mode === "dense" ? "dense" : "thin" };
+    const mode = this.#config.display_mode;
+    this.#mode = mode;
+    if (this.#modeSelect && this.#modeSelect.value !== mode) this.#modeSelect.value = mode;
     if (this.#configured) return;
     this.#configured = true;
     this.#start();
+  }
+
+  _persistMode(mode) {
+    const next = { ...(this.#config ?? { type: `custom:${TAG}` }), display_mode: mode };
+    this.#config = next;
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: next }, bubbles: true, composed: true }));
   }
 
   set hass(value) {
