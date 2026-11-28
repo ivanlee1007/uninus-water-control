@@ -55,7 +55,7 @@ class ManualStatus(SensorEntity):
         self._role = role
         self._attr_unique_id = f"{role.owner.tank_id}_{role.name}_status"
         self._attr_translation_key = f"{role.name}_status"
-        self._attr_translation_placeholders = role.owner.labels
+        self._attr_translation_placeholders = dict(role.owner.labels)
 
     async def async_added_to_hass(self):
         self.async_on_remove(self._role.subscribe(self.async_write_ha_state))
@@ -67,6 +67,19 @@ class ManualStatus(SensorEntity):
     @property
     def extra_state_attributes(self):
         return {"uninus_water_manual": self._role.identity("status") | self._role.snapshot()}
+
+
+@callback
+def async_update_labels(entity: Entity, labels: dict[str, str]) -> bool:
+    """Refresh generated labels while leaving the Registry's user name alone."""
+    if dict(entity.translation_placeholders) == labels:
+        return False
+    entity._attr_translation_placeholders = dict(labels)
+    # Core caches the formatted name independently of its placeholders.
+    entity.__dict__.pop("name", None)
+    if entity.registry_entry is not None:
+        er.async_get(entity.hass).async_update_entity(entity.entity_id, original_name=entity.name)
+    return True
 
 
 class TankLevel(SensorEntity):
@@ -139,8 +152,9 @@ class TankLevel(SensorEntity):
             self._attr_extra_state_attributes["uninus_water_dashboard"] = after
         if source_changed:
             self._async_refresh_source(level_source(er.async_get(self.hass), tank))
+        labels_changed = async_update_labels(self, {"zone": zone["name"], "tank": tank["name"]})
         display_changed = self._refresh_display()
-        if before != after or source_changed or display_changed:
+        if before != after or source_changed or display_changed or labels_changed:
             self.async_write_ha_state()
 
     @callback
@@ -312,14 +326,18 @@ class ThresholdEntity(Entity):
             self.async_write_ha_state()
 
     @callback
-    def async_policy_changed(self, tank: Tank) -> None:
-        if (self._threshold_values(self._tank) == self._threshold_values(tank)
-                and _binding(self._tank, "level_sensor") == _binding(tank, "level_sensor")):
-            return
+    def async_policy_changed(self, tank: Tank, zone: Zone | None = None) -> None:
+        labels = {"zone": zone["name"] if zone else self.translation_placeholders["zone"], "tank": tank["name"]}
+        labels_changed = async_update_labels(self, labels)
+        policy_changed = (self._threshold_values(self._tank) != self._threshold_values(tank)
+                          or _binding(self._tank, "level_sensor") != _binding(tank, "level_sensor"))
         self._tank = tank
-        self._configure_thresholds(tank)
-        self._async_rebind(self._resolve_source())
-        self._async_queue_publish()
+        if policy_changed:
+            self._configure_thresholds(tank)
+            self._async_rebind(self._resolve_source())
+        # A rename must not restart an in-progress alarm qualification timer.
+        if policy_changed or labels_changed:
+            self._async_queue_publish()
 
     def _threshold_values(self, tank: Tank) -> tuple:
         return tuple(tank["thresholds"][key] for key in self._policy_keys)
@@ -362,8 +380,9 @@ class RefillPreview(ThresholdEntity, SensorEntity):
 async def async_reconcile_settings(hass, entry, settings):
     """Refresh only this entry's projections; do not reload platform owners."""
     from .binary_sensor import LowLevelAlarm
+    from .button import ManualButton
 
-    wanted = {"sensor": {}, "binary_sensor": {}}
+    wanted = {"sensor": {}, "binary_sensor": {}, "button": {}}
     levels = {}
     for zi, zone in enumerate(inventory(entry)):
         for ti, tank in enumerate(zone["tanks"]):
@@ -377,6 +396,11 @@ async def async_reconcile_settings(hass, entry, settings):
                     wanted[domain][f"{tank['id']}_{suffix}"] = (cls, zone, effective)
     registry = er.async_get(hass)
     for platform in settings.platforms.values():
+        for entity in platform.entities.values():
+            if isinstance(entity, (ManualStatus, ManualButton)) and async_update_labels(entity, entity._role.owner.labels):
+                entity.async_write_ha_state()
+        if platform.domain == "button":
+            continue
         upcoming = wanted[platform.domain]
         suffix = "_refill_preview" if platform.domain == "sensor" else "_low_level_alarm"
         for row in er.async_entries_for_config_entry(registry, entry.entry_id):
@@ -400,7 +424,7 @@ async def async_reconcile_settings(hass, entry, settings):
             entity_id = registry.async_get_entity_id(platform.domain, DOMAIN, ident)
             entity = platform.entities.get(entity_id)
             if isinstance(entity, ThresholdEntity):
-                entity.async_policy_changed(tank)
+                entity.async_policy_changed(tank, zone)
             elif entity_id is None or not registry.async_get(entity_id).disabled_by:
                 additions.append(cls(entry, zone, tank))
         if additions:

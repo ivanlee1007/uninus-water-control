@@ -21,6 +21,8 @@ from .topology_lifecycle import (
 )
 
 KEY = f"{DOMAIN}.settings"
+# Native Options stores provenance only; all numbers remain in this Store.
+LEGACY_PROVENANCE = "parameter_provenance"
 PAIRS = {"refill": ("refill_lower_m", "refill_upper_m"), "alarm": ("alarm_lower_m", "alarm_delay_seconds")}
 BINDINGS = ("level_sensor", "refill_switch", "alarm_switch")
 ENTRY = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
@@ -284,7 +286,7 @@ class Settings:
                 for tank in zone["tanks"]:
                     anchor = self._anchor(tank)
                     row = policies.get(tank["id"])
-                    rows.append(row if row and row["anchor"] == anchor else {
+                    rows.append({**row, "anchor": anchor} if row and self._row_matches(row, tank, data) else {
                         "id": tank["id"], "anchor": anchor, **self._legacy_policy(tank),
                     })
             common, tanks = _validate({"common": (data or {}).get("common", dict.fromkeys(PAIRS)),
@@ -305,6 +307,12 @@ class Settings:
                 or entry.data is not core_data or entry.options is not core_options):
             raise SettingsError("settings_unavailable")
         mark_owned(self.hass, entry, self.enrollment)
+        if LEGACY_PROVENANCE in entry.options:
+            # The verified owned image has canonical rows and no dependency on
+            # this bridge. Retiring metadata shares Core's witness save; it is
+            # not a second numeric write or an enrollment durability claim.
+            self.hass.config_entries.async_update_entry(entry, options={
+                k: v for k, v in entry.options.items() if k != LEGACY_PROVENANCE})
 
     def _legacy_policy(self, tank):
         owner = self.topology if self.topology is not None else self.entry.data
@@ -321,10 +329,48 @@ class Settings:
     def common(self):
         return self.data["common"] if self.data else dict.fromkeys(PAIRS)
 
+    def _tank_source(self, tank):
+        # A tank-local scope avoids invalidating a bridge on unrelated zone edits.
+        return self.source_snapshot([{"id": tank["id"], "tanks": [tank]}])
+
+    def _row_matches(self, row, tank, data):
+        if row["id"] != tank["id"]:
+            return False
+        anchor = self._anchor(tank)
+        if row["anchor"] == anchor:
+            return True
+        if self.topology is not None:
+            return False
+        bridges = self.entry.options.get(LEGACY_PROVENANCE)
+        bridge = bridges.get(tank["id"]) if type(bridges) is dict else None
+        return (type(bridge) is dict and bridge.keys() == {"generation", "anchor", "target", "source"}
+                and bridge["generation"] == data["generation"] and bridge["anchor"] == row["anchor"]
+                and bridge["target"] == anchor and bridge["source"] == self._tank_source(tank))
+
+    def legacy_provenance(self, zones, data):
+        """Bridge only verified active rows, in the same Options image as bindings.
+
+        No numeric Store write is needed: either old Options/old anchor or new
+        Options/exact bridge resolves the same row, including after a crash.
+        A later parameter Save consumes the bridge by writing a canonical anchor;
+        the next native edit prunes its now-obsolete generation-bound metadata.
+        """
+        previous = {t["id"]: t for z in self.zones for t in z["tanks"]}
+        rows = {r["id"]: r for r in (data or {}).get("tanks", [])}
+        bridges = {}
+        for zone in zones:
+            for tank in zone["tanks"]:
+                old, row = previous.get(tank["id"]), rows.get(tank["id"])
+                if (old is not None and row is not None and self._row_matches(row, old, data)
+                        and row["anchor"] != self._anchor(tank)):
+                    bridges[tank["id"]] = {"generation": data["generation"], "anchor": row["anchor"],
+                                          "target": self._anchor(tank), "source": self._tank_source(tank)}
+        return bridges
+
     def _policy(self, tank):
         if self.data:
             for row in self.data["tanks"]:
-                if row["id"] == tank["id"] and row["anchor"] == self._anchor(tank):
+                if self._row_matches(row, tank, self.data):
                     return row
         return self._legacy_policy(tank)
 
@@ -378,7 +424,7 @@ class Settings:
         before = {t["id"]: t for z in self.zones for t in z["tanks"]} if topology is not None else live
         active = {row["id"]: {**row, "anchor": self._anchor(live[row["id"]])}
                   for row in (self.data or {}).get("tanks", []) if row["id"] in live and row["id"] in before
-                  and row["anchor"] == self._anchor(before[row["id"]])}
+                  and self._row_matches(row, before[row["id"]], self.data)}
         for ident, edit in edits.items():
             row = active.get(ident) or {"id": ident, "anchor": self._anchor(live[ident]),
                                         **self._legacy_policy(live[ident])}
@@ -434,14 +480,23 @@ class Settings:
             if self.generation != generation or data != self.data:
                 raise SettingsError("configuration_changed")
             admitted()
-            topology = validate_topology(deepcopy(self.topology | {"zones": zones, "manual": manual}), _pair, _number)
+            from .binding_validation import binding_errors
+
+            if binding_errors(er.async_get(self.hass), self.zones, zones):
+                raise SettingsError("binding_conflict")
+            live = {tank["id"] for zone in zones for tank in zone["tanks"]}
+            topology = validate_topology(deepcopy(self.topology | {"zones": zones, "manual": manual,
+                DISPLAY_SCALES: {key: value for key, value in self.topology[DISPLAY_SCALES].items() if key in live}}),
+                _pair, _number)
             by_id = {row["id"]: row for row in data["tanks"]}
+            previous = {tank["id"]: tank for zone in self.zones for tank in zone["tanks"]}
             rows = []
             for zone in topology["zones"]:
                 for tank in zone["tanks"]:
                     old = by_id.get(tank["id"])
                     anchor = self._anchor(tank)
-                    rows.append(old if old and old["anchor"] == anchor else {
+                    rows.append({**old, "anchor": anchor} if old and tank["id"] in previous
+                                and old["anchor"] == self._anchor(previous[tank["id"]]) else {
                         "id": tank["id"], "anchor": anchor, **self._legacy_policy(tank),
                     })
             common, tanks = _validate({"common": data["common"], "tanks": rows}, stored=True)

@@ -374,6 +374,7 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         peer_preview = self.entity("sensor", "refill_preview", peer)
         alarm = self.entity("binary_sensor", "low_level_alarm")
         peer_alarm = self.entity("binary_sensor", "low_level_alarm", peer)
+        original_registry_ids = {ident: self.registry.async_get(ident).id for ident in (preview, alarm)}
         await self.wait_for_state(alarm, "on")
         self.assert_state(peer_preview, "stop_threshold")
         self.assert_state(peer_alarm, "off")
@@ -391,11 +392,13 @@ class NativeThresholdPreviewTest(unittest.IsolatedAsyncioTestCase):
         self.assert_state(alarm, "unavailable")
         self.assert_state(peer_alarm, "off")
         await self.save(await self.select("edit_tank", tank_id=self.tank), tank_name="Renamed", level_sensor=self.probe)
-        # A deliberate rebind is allowed, but a settings overlay for the old
-        # source isn't transferred. Explicitly configure the replacement.
-        self.assertIsNone(self.entity("sensor", "refill_preview"))
-        self.assertIsNone(self.entity("binary_sensor", "low_level_alarm"))
-        self.assertEqual(self.effective_policy(), {})
+        # C preserves numeric parameters only after this explicit native
+        # rebind. The passive alias takeover above still remained unavailable.
+        self.assertEqual(self.entity("sensor", "refill_preview"), preview)
+        self.assertEqual(self.entity("binary_sensor", "low_level_alarm"), alarm)
+        self.assertEqual(self.effective_policy(), REFILL | ALARM)
+        self.assertEqual({ident: self.registry.async_get(ident).id for ident in (preview, alarm)},
+                         original_registry_ids)
         await self.save(await self.thresholds(), **(REFILL | ALARM))
         preview = self.entity("sensor", "refill_preview")
         alarm = self.entity("binary_sensor", "low_level_alarm")

@@ -98,6 +98,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = ManualController(hass, entry, settings)
     platforms = [*PLATFORMS, Platform.BUTTON] if entry.runtime_data.roles else PLATFORMS
     await hass.config_entries.async_forward_entry_setups(entry, platforms)
+    entry.runtime_data.activate()
     alarm_history.attach(hass, entry, entry.runtime_data)
     return True
 

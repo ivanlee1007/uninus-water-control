@@ -11,7 +11,7 @@ from uuid import UUID
 
 from aiohttp import ClientSession, ClientTimeout
 from homeassistant import auth, loader
-from homeassistant.config_entries import ConfigEntries, ConfigEntryState
+from homeassistant.config_entries import HANDLERS, ConfigEntries, ConfigEntryState
 from homeassistant.const import ATTR_UNIT_OF_MEASUREMENT, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -39,6 +39,7 @@ class DashboardProjectionTest(unittest.IsolatedAsyncioTestCase):
                     if name == prefix or name.startswith(f"{prefix}.")}
 
         original = integration_modules()
+        original_handler = HANDLERS.get(DOMAIN)
         original_binding = getattr(namespace, DOMAIN, None)
         for name in original:
             del sys.modules[name]
@@ -49,6 +50,12 @@ class DashboardProjectionTest(unittest.IsolatedAsyncioTestCase):
             for name in integration_modules():
                 del sys.modules[name]
             sys.modules.update(original)
+            # Flow handlers are global too: retaining the temporary class pairs
+            # its old SettingsError with a different restored module instance.
+            if original_handler is None:
+                HANDLERS.pop(DOMAIN, None)
+            else:
+                HANDLERS[DOMAIN] = original_handler
             if original_binding is not None:
                 setattr(namespace, DOMAIN, original_binding)
             elif hasattr(namespace, DOMAIN):
@@ -158,7 +165,11 @@ class DashboardProjectionTest(unittest.IsolatedAsyncioTestCase):
         entry = (await self.save(hass, flow, form, **fields))["result"]
         self.assertIs(entry.state, ConfigEntryState.LOADED)
         options = hass.config_entries.options
-        await self.save(hass, options, await self.choose(options, entry, "add_zone"), **fields)
+        # Keep duplicate labels, not newly shared private sources/outputs.
+        hass.states.async_set("sensor.other_zone_depth", "125", {ATTR_UNIT_OF_MEASUREMENT: "cm"})
+        await self.save(hass, options, await self.choose(options, entry, "add_zone"),
+                        **({key: value for key, value in fields.items() if key not in ("refill_switch", "alarm_switch")}
+                           | {"level_sensor": "sensor.other_zone_depth"}))
         north, other = entry.options["zones"]
         await self.save(hass, options, await self.choose(options, entry, "add_tank", zone_id=north["id"]),
                         tank_name=fields["tank_name"], level_sensor="sensor.backup")
@@ -175,6 +186,7 @@ class DashboardProjectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.assert_projected(hass, entry, entry.options["zones"], reading), ids)
 
         hass.states.async_set(source.entity_id, "5", {ATTR_UNIT_OF_MEASUREMENT: "%"})
+        hass.states.async_remove("sensor.other_zone_depth")
         hass.states.async_remove("sensor.backup")
         await hass.async_block_till_done()
         self.assertEqual(self.assert_projected(hass, entry, entry.options["zones"],

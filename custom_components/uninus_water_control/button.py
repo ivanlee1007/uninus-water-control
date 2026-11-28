@@ -4,11 +4,15 @@ from homeassistant.auth.permissions.const import POLICY_CONTROL
 from homeassistant.components.button import ButtonEntity
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 
+from homeassistant.helpers.entity_platform import async_get_current_platform
+
 from .manual import ACTIONS
 from .settings import SettingsError
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
+    platform = async_get_current_platform()
+    entry.runtime_data.settings.platforms[platform.domain] = platform
     async_add_entities(ManualButton(role, action) for role in entry.runtime_data.roles.values() for action in ACTIONS)
 
 
@@ -21,7 +25,7 @@ class ManualButton(ButtonEntity):
         self._action = action
         self._attr_unique_id = f"{role.owner.tank_id}_{role.name}_{action}"
         self._attr_translation_key = f"{role.name}_{action}"
-        self._attr_translation_placeholders = role.owner.labels
+        self._attr_translation_placeholders = dict(role.owner.labels)
         self._attr_extra_state_attributes = {"uninus_water_manual": role.identity(action)}
 
     async def _async_authorize(self, context):

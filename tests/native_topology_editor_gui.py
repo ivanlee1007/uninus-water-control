@@ -1,4 +1,4 @@
-"""Native, authenticated Lovelace topology editor acceptance on owned loopback."""
+"""Native C display/Quick UI plus retained authenticated topology wire compatibility."""
 import asyncio
 import json
 import logging
@@ -162,30 +162,32 @@ async def run(root, entry_id):
                 yaml_before = await page.evaluate(gui.SETTINGS_CALL, {'type': 'lovelace/config'})
                 core_before = core_entry_row()
                 writes.clear()
+                # Lovelace has no operational/topology writer in architecture C.
                 await enter_dashboard_edit(page, 'Edit dashboard')
-                for cancel in (True, False):
-                    modal, editor = await gui.open_card_editor(page, 'Edit')
-                    preview = modal.get_by_role('button', name='手動補水', exact=True)
-                    await expect(preview).to_be_disabled()
-                    await preview.dispatch_event('click')
-                    await editor.get_by_role('button', name='編輯區域與水桶', exact=True).click()
-                    add = editor.get_by_role('button', name='新增水桶', exact=True)
-                    await expect(add).to_be_visible()
-                    await add.click()
-                    await editor.get_by_role('textbox', name='水桶名稱', exact=True).last.fill('新水桶')
-                    picker = editor.locator('ha-entity-picker[data-role="level_sensor"]').last
-                    # Native combo and its real filter menu, not a synthetic value event.
-                    await choose_entity(picker, 'sensor.backup')
-                    await expect(editor.get_by_role('button', name='套用整合設定', exact=True)).to_be_enabled()
-                    assert not writes and image.read_bytes() == before, [
-                        (msg['type'], msg.get('domain'), msg.get('service')) for msg in writes]
-                    await expect(shell.get_by_role('button', name='新水桶 · 2.40 m', exact=True)).to_have_count(0)
-                    if cancel:
-                        await modal.get_by_role('button', name='Cancel', exact=True).press('Enter')
-                        await expect(modal).to_have_count(0)
-                        assert not writes and image.read_bytes() == before, [msg['type'] for msg in writes]
-                await editor.get_by_role('button', name='套用整合設定', exact=True).click()
-                await expect(editor.get_by_text('已套用；不必再按外層儲存。', exact=True)).to_be_visible()
+                modal, display = await gui.open_card_editor(page, 'Edit')
+                preview = modal.get_by_role('button', name='手動補水', exact=True)
+                await expect(preview).to_be_disabled()
+                await preview.dispatch_event('click')
+                await expect(display.get_by_role('button', name='編輯區域與水桶', exact=True)).to_have_count(0)
+                await expect(display.get_by_role('spinbutton')).to_have_count(0)
+                await display.get_by_role('checkbox', name='顯示詳細狀態', exact=True).check()
+                assert not writes and image.read_bytes() == before
+                await modal.get_by_role('button', name='Cancel', exact=True).press('Enter')
+                await expect(modal).to_have_count(0)
+                assert not writes and image.read_bytes() == before
+                await page.locator('hui-root .exit-edit-mode').click()
+                await expect(shell.get_by_role('button', name='手動補水', exact=True)).to_be_enabled()
+
+                # The old topology GUI has been retired, not secretly kept as an
+                # operational editor. Preserve exact backend compatibility checks
+                # through the authenticated native WS. Native Options picker CRUD
+                # acceptance is a separate integration-owner gate.
+                topology = await get_topology(page, entry_id)
+                zones = writable_zones(topology)
+                zones[0]['tanks'].append({'id': None, 'name': '新水桶',
+                    'level_sensor': {'entity_id': source.entity_id, 'registry_id': source.id},
+                    'refill_switch': None, 'alarm_switch': None})
+                await save_topology(page, topology, zones)
                 write, = writes
                 assert write['type'] == f'{gui.DOMAIN}/topology_save' and write['entry_id'] == entry_id
                 assert write['zones'][0]['tanks'][-1]['level_sensor'] == {'entity_id': source.entity_id, 'registry_id': source.id}
@@ -193,102 +195,89 @@ async def run(root, entry_id):
                 new = stored['topology']['zones'][0]['tanks'][-1]
                 assert new['name'] == '新水桶' and new['refill_switch'] is None and new['alarm_switch'] is None
                 assert new['level_sensor_registry_id'] == source.id and entry.runtime_data is owner and owner.roles['refill'] is existing_role
-                assert not calls, calls
-                core_after = core_entry_row()
-                assert core_after == core_before, [k for k in core_after if core_after[k] != core_before.get(k)]
+                assert not calls and core_entry_row() == core_before
                 native = registry.async_get_entity_id('sensor', gui.DOMAIN, new['id'])
                 assert hass.states.get(native).attributes['uninus_water_dashboard']['tank']['id'] == new['id']
-                await modal.get_by_role('button', name='Cancel', exact=True).press('Enter')
-                await expect(modal).to_have_count(0)
                 await expect(shell.get_by_role('button', name='新水桶 · 2.40 m', exact=True)).to_be_visible()
                 assert await page.evaluate(gui.SETTINGS_CALL, {'type': 'lovelace/config'}) == yaml_before
                 assert len(writes) == 1
-            await narrow_crud(browser, restrict, dashboard, image, new, extra, spare)
-            replacement = await same_name_replacement(browser, restrict, dashboard, image, registry, hass, source, native)
-            await revision_conflict(browser, restrict, dashboard, image, entry, new['id'])
-            assert entry.runtime_data is owner and owner.roles['refill'] is existing_role and not calls
-            assert core_entry_row() == core_before
-        print('NATIVE_TOPOLOGY_GUI', json.dumps({'id': new['id'], 'entity_id': native, 'writes': len(writes),
+                initial_write_count = len(writes)
+                await topology_compatibility_crud(page, entry_id, image, new, extra, spare)
+                # Registered topology writes refresh real native names, not only DTO labels.
+                for zone in owner.zones:
+                    for tank in zone['tanks']:
+                        entity_id = registry.async_get_entity_id('sensor', gui.DOMAIN, tank['id'])
+                        row = registry.async_get(entity_id)
+                        expected_name = f"{zone['name']} · {tank['name']} water level"
+                        assert row.original_name == expected_name
+                        assert hass.states.get(entity_id).attributes['friendly_name'] == expected_name
+                manual_row = registry.async_get(registry.async_get_entity_id('sensor', gui.DOMAIN, f"{owner.tank_id}_refill_status"))
+                assert manual_row.original_name == '同名區 · Storage refill status'
+                print('NATIVE_TOPOLOGY_NAMES_OK registered rename refreshes real Core names', flush=True)
+                replacement = await same_name_replacement(page, entry_id, image, registry, hass, source, native)
+                writes.clear()
+                await revision_conflict(page, ctx, dashboard, image, entry, new['id'], writes)
+                assert entry.runtime_data is owner and owner.roles['refill'] is existing_role and not calls
+                assert core_entry_row() == core_before
+        print('NATIVE_TOPOLOGY_GUI', json.dumps({'id': new['id'], 'entity_id': native, 'writes': initial_write_count,
               'replacement': replacement.id, 'calls': calls}), flush=True)
     finally:
         await hass.async_stop()
 
 
-async def narrow_crud(browser, restrict, dashboard, image, existing, extra, spare):
-    writes = []
-    async with await browser.new_context(locale='zh-Hant', viewport={'width': 390, 'height': 844}) as ctx:
-        await ctx.route('**/*', restrict)
-        page = await ctx.new_page()
-        page.set_default_timeout(9000)
-        await page.add_init_script("""
-            window.waterEditorDialogEvents = [];
-            addEventListener('dialog-closed', e => waterEditorDialogEvents.push(['close', e.detail?.dialog, performance.now()]), true);
-        """)
-        observe_writes(page, writes)
-        await gui.native_login(page, dashboard)
-        await page.wait_for_function("document.querySelector('home-assistant')?.hass?.locale?.language === 'zh-Hant'")
-        shell = page.locator(f'hui-panel-view {gui.CARD_TAG}:visible')
-        await expect(shell.get_by_role('button', name='新水桶 · 2.40 m', exact=True)).to_be_visible()
-        await enter_dashboard_edit(page, '編輯主面板')
-        modal, editor = await gui.open_card_editor(page, '編輯')
-        await editor.get_by_role('button', name='編輯區域與水桶', exact=True).click()
-        zone_labels = editor.get_by_role('textbox', name='區域名稱', exact=True)
-        tank_labels = editor.get_by_role('textbox', name='水桶名稱', exact=True)
-        await zone_labels.first.fill('同名區')
-        await tank_labels.nth(1).fill('已改名桶')
-        await editor.get_by_role('button', name='新增區域', exact=True).click()
-        await zone_labels.last.fill('同名區')
-        await tank_labels.last.fill('已改名桶')
-        await choose_entity(editor.locator('ha-entity-picker[data-role="level_sensor"]').last, extra.entity_id)
-        await choose_entity(editor.locator('ha-entity-picker[data-role="alarm_switch"]').nth(1), spare.entity_id)
-        assert not writes
-        apply = editor.get_by_role('button', name='套用整合設定', exact=True)
-        await apply.click()
-        await expect(editor.get_by_text('已套用；不必再按外層儲存。', exact=True)).to_be_visible()
-        zones = json.loads(image.read_bytes())['data']['topology']['zones']
-        assert [zone['name'] for zone in zones] == ['同名區', '同名區']
-        assert zones[0]['tanks'][1]['id'] == existing['id']
-        assert zones[0]['tanks'][1]['name'] == '已改名桶'
-        assert zones[0]['tanks'][1]['alarm_switch_registry_id'] == spare.id
-        second, = zones[1]['tanks']
-        assert second['name'] == '已改名桶' and second['id'] != existing['id']
-
-        await editor.get_by_role('button', name='移除區域', exact=True).last.click()
-        confirmation = editor.get_by_role('group', name='移除範圍確認')
-        await expect(confirmation.get_by_role('listitem')).to_have_text([
-            '區域：同名區（第 2 區）', '水桶：同名區（第 2 區） · 已改名桶（第 1 桶）',
-        ])
-        await expect(apply).to_be_disabled()
-        await confirmation.get_by_role('checkbox').check()
-        await apply.click()
-        await expect(editor.get_by_text('已套用；不必再按外層儲存。', exact=True)).to_be_visible()
-        assert [msg['type'] for msg in writes] == [f'{gui.DOMAIN}/topology_save'] * 2
-        assert writes[1]['remove'] == {'zones': [zones[1]['id']], 'tanks': [second['id']]}
-        assert json.loads(image.read_bytes())['data']['topology']['zones'] == zones[:1]
-
-        await editor.get_by_role('button', name='新增水桶', exact=True).click()
-        await tank_labels.last.fill('暫存桶')
-        await choose_entity(editor.locator('ha-entity-picker[data-role="level_sensor"]').last, extra.entity_id)
-        await apply.click()
-        await expect(editor.get_by_text('已套用；不必再按外層儲存。', exact=True)).to_be_visible()
-        spare_tank = json.loads(image.read_bytes())['data']['topology']['zones'][0]['tanks'][-1]
-        assert spare_tank['name'] == '暫存桶' and spare_tank['id'] != second['id']
-        await editor.get_by_role('button', name='移除水桶', exact=True).last.click()
-        await expect(confirmation.get_by_role('listitem')).to_have_text(['水桶：同名區（第 1 區） · 暫存桶（第 3 桶）'])
-        await expect(apply).to_be_disabled()
-        await confirmation.get_by_role('checkbox').check()
-        await apply.click()
-        await expect(editor.get_by_text('已套用；不必再按外層儲存。', exact=True)).to_be_visible()
-        assert [msg['type'] for msg in writes] == [f'{gui.DOMAIN}/topology_save'] * 4
-        assert writes[3]['remove'] == {'zones': [], 'tanks': [spare_tank['id']]}
-        assert json.loads(image.read_bytes())['data']['topology']['zones'] == zones[:1]
-        await modal.get_by_role('button', name='取消', exact=True).press('Enter')
-        await expect(modal).to_have_count(0)
-        await expect(shell.get_by_role('button', name='已改名桶 · 2.40 m', exact=True)).to_be_visible()
-        print('NATIVE_TOPOLOGY_GUI_NARROW_OK', flush=True)
+async def get_topology(page, entry_id):
+    return await page.evaluate(gui.SETTINGS_CALL, {'type': f'{gui.DOMAIN}/topology_get', 'version': 1, 'entry_id': entry_id})
 
 
-async def same_name_replacement(browser, restrict, dashboard, image, registry, hass, source, projection):
+def writable_zones(topology):
+    return [{'id': z['id'], 'name': z['name'], 'tanks': [
+        {k: v for k, v in t.items() if k != 'protected'} for t in z['tanks']]} for z in topology['zones']]
+
+
+async def save_topology(page, baseline, zones, remove=None):
+    payload = {'type': f'{gui.DOMAIN}/topology_save', 'version': 1, 'entry_id': baseline['entry_id'],
+        'if_revision': baseline['revision'], 'if_source_snapshot': baseline['source_snapshot'],
+        'zones': zones, 'remove': remove or {'zones': [], 'tanks': []}, 'changes': {}}
+    saved = await page.evaluate(gui.SETTINGS_CALL, payload)
+    assert await get_topology(page, baseline['entry_id']) == saved
+    return saved
+
+
+async def topology_compatibility_crud(page, entry_id, image, existing, extra, spare):
+    baseline = await get_topology(page, entry_id)
+    zones = writable_zones(baseline)
+    zones[0]['name'] = '同名區'
+    zones[0]['tanks'][1]['name'] = '已改名桶'
+    zones[0]['tanks'][1]['alarm_switch'] = {'entity_id': spare.entity_id, 'registry_id': spare.id}
+    zones.append({'id': None, 'name': '同名區', 'tanks': [{'id': None, 'name': '已改名桶',
+        'level_sensor': {'entity_id': extra.entity_id, 'registry_id': extra.id}, 'refill_switch': None, 'alarm_switch': None}]})
+    baseline = await save_topology(page, baseline, zones)
+    stored = json.loads(image.read_bytes())['data']['topology']['zones']
+    assert [zone['name'] for zone in stored] == ['同名區', '同名區']
+    assert stored[0]['tanks'][1]['id'] == existing['id'] and stored[0]['tanks'][1]['name'] == '已改名桶'
+    assert stored[0]['tanks'][1]['alarm_switch_registry_id'] == spare.id
+    second, = stored[1]['tanks']
+    assert second['name'] == '已改名桶' and second['id'] != existing['id']
+    zones = writable_zones(baseline)
+    removed = zones.pop()
+    exact_remove = {'zones': [removed['id']], 'tanks': [second['id']]}
+    baseline = await save_topology(page, baseline, zones, exact_remove)
+    assert json.loads(image.read_bytes())['data']['topology']['zones'] == stored[:1]
+    zones = writable_zones(baseline)
+    zones[0]['tanks'].append({'id': None, 'name': '暫存桶',
+        'level_sensor': {'entity_id': extra.entity_id, 'registry_id': extra.id}, 'refill_switch': None, 'alarm_switch': None})
+    baseline = await save_topology(page, baseline, zones)
+    spare_tank = json.loads(image.read_bytes())['data']['topology']['zones'][0]['tanks'][-1]
+    assert spare_tank['name'] == '暫存桶' and spare_tank['id'] != second['id']
+    zones = writable_zones(baseline)
+    zones[0]['tanks'].pop()
+    await save_topology(page, baseline, zones, {'zones': [], 'tanks': [spare_tank['id']]})
+    assert json.loads(image.read_bytes())['data']['topology']['zones'] == stored[:1]
+    await expect(page.locator(f'hui-panel-view {gui.CARD_TAG}:visible').get_by_role('button', name='已改名桶 · 2.40 m', exact=True)).to_be_visible()
+    print('NATIVE_TOPOLOGY_COMPATIBILITY_CRUD_OK', flush=True)
+
+
+async def same_name_replacement(page, entry_id, image, registry, hass, source, projection):
     ident = source.entity_id
     initial = image.read_bytes()
     registry.async_remove(ident)
@@ -300,121 +289,65 @@ async def same_name_replacement(browser, restrict, dashboard, image, registry, h
         while hass.states.get(projection).state != 'unavailable':
             await asyncio.sleep(.01)
     assert image.read_bytes() == initial
-    writes = []
-    async with await browser.new_context(locale='zh-Hant', viewport={'width': 1180, 'height': 920}) as ctx:
-        await ctx.route('**/*', restrict)
-        page = await ctx.new_page()
-        page.set_default_timeout(9000)
-        await page.add_init_script("""
-            window.waterEditorDialogEvents = [];
-            addEventListener('dialog-closed', e => waterEditorDialogEvents.push(['close', e.detail?.dialog, performance.now()]), true);
-        """)
-        observe_writes(page, writes)
-        await gui.native_login(page, dashboard)
-        await page.wait_for_function("document.querySelector('home-assistant')?.hass?.locale?.language === 'zh-Hant'")
-        shell = page.locator(f'hui-panel-view {gui.CARD_TAG}:visible')
-        await expect(shell.get_by_role('button', name='Storage · 1.25 m', exact=True)).to_be_visible()
-        await enter_dashboard_edit(page, '編輯主面板')
-        modal, editor = await gui.open_card_editor(page, '編輯')
-        await editor.get_by_role('button', name='編輯區域與水桶', exact=True).click()
-        picker = editor.locator('ha-entity-picker[data-role="level_sensor"]').last
-        protected = editor.locator('ha-entity-picker[data-role="level_sensor"]').first
-        apply = editor.get_by_role('button', name='套用整合設定', exact=True)
-        await expect(picker.locator('ha-picker-field')).to_be_visible()
-        await expect(apply).to_be_disabled()
-        await expect(protected).to_have_js_property('disabled', True)
-        assert not writes and image.read_bytes() == initial
-        print('NATIVE_REBIND_READY projection=unavailable; mounted picker and protected source verified', flush=True)
-        assert not await picker.evaluate('el => el.value'), 'missing registered row must not select replacement alias'
-        unavailable = editor.locator('p:visible').filter(has_text='液位感測器：現有綁定無法使用。')
-        await expect(unavailable).to_be_visible()
-        await expect(picker.get_by_text('試驗替代水位', exact=True)).to_have_count(0)
-        await choose_entity(picker, ident)
-        await expect(apply).to_be_enabled()
-        assert not writes and image.read_bytes() == initial and hass.states.get(projection).state == 'unavailable'
-        await apply.click()
-        await expect(editor.get_by_text('已套用；不必再按外層儲存。', exact=True)).to_be_visible()
-        write, = writes
-        old_tank, new_tank = json.loads(initial)['data']['topology']['zones'][0]['tanks']
-        old_readback, new_readback = json.loads(image.read_bytes())['data']['topology']['zones'][0]['tanks']
-        assert write['type'] == f'{gui.DOMAIN}/topology_save'
-        assert write['zones'][0]['tanks'][-1]['level_sensor'] == {'entity_id': ident, 'registry_id': replacement.id}
-        assert old_readback == old_tank
-        assert new_readback == new_tank | {'level_sensor_registry_id': replacement.id}
-        assert hass.states.get(projection).state == '0.93'
-        await modal.get_by_role('button', name='取消', exact=True).press('Enter')
-        await expect(modal).to_have_count(0)
-        await expect(shell.get_by_role('button', name='已改名桶 · 0.93 m', exact=True)).to_be_visible()
-        assert len(writes) == 1
+    baseline = await get_topology(page, entry_id)
+    assert baseline['zones'][0]['tanks'][-1]['level_sensor'] == {'entity_id': None, 'registry_id': source.id}
+    assert baseline['zones'][0]['tanks'][0]['protected']
+    # An explicit native authenticated compatibility request, not an alias fallback.
+    zones = writable_zones(baseline)
+    zones[0]['tanks'][-1]['level_sensor'] = {'entity_id': ident, 'registry_id': replacement.id}
+    await save_topology(page, baseline, zones)
+    old_tank, new_tank = json.loads(initial)['data']['topology']['zones'][0]['tanks']
+    old_readback, new_readback = json.loads(image.read_bytes())['data']['topology']['zones'][0]['tanks']
+    assert old_readback == old_tank and new_readback == new_tank | {'level_sensor_registry_id': replacement.id}
+    assert hass.states.get(projection).state == '0.93'
+    await expect(page.locator(f'hui-panel-view {gui.CARD_TAG}:visible').get_by_role('button', name='已改名桶 · 0.93 m', exact=True)).to_be_visible()
     return replacement
 
 
-async def revision_conflict(browser, restrict, dashboard, image, entry, tank_id):
-    writes = []
-    async with await browser.new_context(locale='zh-Hant', viewport={'width': 1180, 'height': 920}) as ctx:
-        await ctx.route('**/*', restrict)
-        page = await ctx.new_page()
-        page.set_default_timeout(9000)
-        await page.add_init_script("""
-            window.waterEditorDialogEvents = [];
-            addEventListener('dialog-closed', e => waterEditorDialogEvents.push(['close', e.detail?.dialog, performance.now()]), true);
-        """)
-        observe_writes(page, writes)
-        await gui.native_login(page, dashboard)
-        await page.wait_for_function("document.querySelector('home-assistant')?.hass?.locale?.language === 'zh-Hant'")
-        shell = page.locator(f'hui-panel-view {gui.CARD_TAG}:visible')
-        await expect(shell.get_by_role('button', name='已改名桶 · 0.93 m', exact=True)).to_be_visible()
-        await enter_dashboard_edit(page, '編輯主面板')
-        modal, editor = await gui.open_card_editor(page, '編輯')
-        await editor.get_by_role('button', name='編輯區域與水桶', exact=True).click()
-        draft = editor.get_by_role('textbox', name='水桶名稱', exact=True).last
-        await draft.fill('尚未套用的操作員草稿')
-        before = await gui.read_settings(page, entry)
-        assert not writes
-        # Second authenticated native writer changes only the current scale.
-        other = await ctx.new_page()
-        await gui.native_login(other, dashboard)
-        latest = await gui.publish_settings(other, before, {'tanks': [{'id': tank_id, 'scale_max_m': 4.75}]})
-        await other.close()
-        assert latest['revision'] != before['revision'] and latest['source_snapshot'] == before['source_snapshot']
-        physical = image.read_bytes()
-        apply = editor.get_by_role('button', name='套用整合設定', exact=True)
-        await apply.click()
-        await expect(editor.get_by_text('設定已被變更', exact=False)).to_be_visible()
-        await expect(apply).to_be_disabled()
-        write, = writes
-        assert write['type'] == f'{gui.DOMAIN}/topology_save'
-        assert (write['if_revision'], write['if_source_snapshot']) == (before['revision'], before['source_snapshot'])
-        assert image.read_bytes() == physical and await draft.input_value() == '尚未套用的操作員草稿'
-        print('NATIVE_CONFLICT_READY stale_revision from registered writer, original CAS and physical bytes checked', flush=True)
-        review = editor.get_by_role('button', name='讀取目前設定（保留草稿）', exact=True)
-        await review.click()
-        panel = editor.get_by_role('region', name='整合目前設定（唯讀）', exact=True)
-        await expect(panel.get_by_text('水位顯示量程：4.75 m', exact=True)).to_be_visible()
-        await expect(panel.get_by_text('液位感測器：sensor.backup', exact=True)).to_be_visible()
-        await expect(draft).to_have_value('尚未套用的操作員草稿')
-        await expect(draft).to_be_disabled()
-        assert len(writes) == 1 and image.read_bytes() == physical
-        if screenshots := os.environ.get('WATER_NATIVE_CONFLICT_CAPTURE'):
-            target = Path(screenshots)
-            assert target.is_absolute()
-            target.mkdir(parents=True, exist_ok=True)
-            for width, height, label in ((1180, 920, 'wide'), (390, 844, 'narrow')):
-                await page.set_viewport_size({'width': width, 'height': height})
-                current_value = panel.get_by_text('水位顯示量程：4.75 m', exact=True)
-                await current_value.evaluate("el => el.scrollIntoView({block:'center'})")
-                await expect(current_value).to_be_in_viewport()
-                await page.evaluate('document.fonts.ready')
-                await page.screenshot(path=target / f'conflict-zh-Hant-{label}.png', animations='disabled')
-        await editor.get_by_role('button', name='重新讀取（捨棄草稿）', exact=True).click()
-        await expect(draft).to_have_value('已改名桶')
-        await expect(panel).to_have_count(0)
-        await expect(apply).to_be_disabled()
-        assert len(writes) == 1 and image.read_bytes() == physical
-        await modal.get_by_role('button', name='取消', exact=True).press('Enter')
-        await expect(modal).to_have_count(0)
-        assert len(writes) == 1 and image.read_bytes() == physical
-        print('NATIVE_CONFLICT_OK reviewed 4.75 m, original draft retained then explicitly discarded, no replay', flush=True)
+async def revision_conflict(page, ctx, dashboard, image, entry, tank_id, writes):
+    modal, quick = await gui.open_quick_parameters(page, tank_id)
+    draft = quick.get_by_role('spinbutton', name='水位顯示量程上限（m）', exact=True)
+    await draft.fill('2.75')
+    before = await gui.read_settings(page, entry)
+    assert not writes
+    other = await ctx.new_page()
+    await gui.native_login(other, dashboard)
+    latest = await gui.publish_settings(other, before, {'tanks': [{'id': tank_id, 'scale_max_m': 4.75}]})
+    await other.close()
+    assert latest['revision'] != before['revision'] and latest['source_snapshot'] == before['source_snapshot']
+    physical = image.read_bytes()
+    apply = quick.get_by_role('button', name='儲存此桶參數', exact=True)
+    await apply.click()
+    await expect(quick.get_by_text('設定已被變更', exact=False)).to_be_visible()
+    await expect(apply).to_be_disabled()
+    write, = writes
+    assert write['type'] == f'{gui.DOMAIN}/config_save'
+    assert (write['if_revision'], write['if_source_snapshot']) == (before['revision'], before['source_snapshot'])
+    assert write['changes'] == {'tanks': [{'id': tank_id, 'scale_max_m': 2.75}]}
+    assert image.read_bytes() == physical and await draft.input_value() == '2.75'
+    review = quick.get_by_role('button', name='讀取目前設定（保留草稿）', exact=True)
+    await review.click()
+    panel = quick.get_by_role('region', name='整合目前設定（唯讀）', exact=True)
+    await expect(panel.get_by_text('水位顯示量程：4.75 m', exact=True)).to_be_visible()
+    # Bindings are deliberately not editable/read out through Quick parameters.
+    topology = await get_topology(page, entry.entry_id)
+    assert topology['zones'][0]['tanks'][-1]['level_sensor']['entity_id'] == 'sensor.backup'
+    await expect(draft).to_have_value('2.75'); await expect(draft).to_be_disabled()
+    assert len(writes) == 1 and image.read_bytes() == physical
+    if screenshots := os.environ.get('WATER_NATIVE_CONFLICT_CAPTURE'):
+        target = Path(screenshots)
+        assert target.is_absolute(); target.mkdir(parents=True, exist_ok=True)
+        for width, height, label in ((1180, 920, 'wide'), (390, 844, 'narrow')):
+            await page.set_viewport_size({'width': width, 'height': height})
+            current = panel.get_by_text('水位顯示量程：4.75 m', exact=True)
+            await current.scroll_into_view_if_needed(); await expect(current).to_be_in_viewport()
+            await page.screenshot(path=target / f'conflict-c-{label}.png', animations='disabled')
+    await quick.get_by_role('button', name='重新讀取（捨棄草稿）', exact=True).click()
+    await expect(draft).to_have_value('4.75'); await expect(panel).to_have_count(0); await expect(apply).to_be_disabled()
+    assert len(writes) == 1 and image.read_bytes() == physical
+    await modal.get_by_role('button', name='取消', exact=True).click()
+    assert len(writes) == 1 and image.read_bytes() == physical
+    print('NATIVE_CONFLICT_OK real Quick stale_revision, original CAS/draft preserved, explicit current review/discard, zero replay', flush=True)
 
 
 if __name__ == '__main__':

@@ -21,7 +21,10 @@
       "invalid_sensor": "Select a sensor entity.",
       "invalid_switch": "Select a switch entity or leave this field empty.",
       "own_level_sensor": "Choose a source sensor, not a level sensor created by this integration.",
-      "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again."
+      "level_source_changed": "The sensor at this entity ID changed while the form was open. Review the selection. To use the replacement at the previous entity ID, reopen this form and select it again.",
+      "output_source_changed": "The switch at this entity ID changed. Reopen the form and explicitly select the intended switch.",
+      "shared_output": "This output or device is referenced by another role. Verify and resolve the shared mapping first.",
+      "shared_source": "The level source is already referenced by another tank. Verify the physical mapping first."
     },
     "abort": {
       "already_configured": "The water controller is already configured. Use Configure to manage its inventory."
@@ -34,7 +37,9 @@
         "menu_options": {
           "add_zone": "Add zone", "edit_zone": "Rename zone", "remove_zone": "Remove zone",
           "add_tank": "Add tank", "edit_tank": "Edit tank", "remove_tank": "Remove tank",
-          "card_settings": "Thresholds and display scale: dashboard card editor",
+          "card_settings": "Common parameters",
+          "common_parameters": "Common parameter defaults",
+          "tank_parameters": "Tank parameters",
           "enroll_topology": "Transfer topology to the integration store",
           "topology_status": "Topology transfer status"
         }
@@ -51,6 +56,34 @@
         "title": "Prepare a topology transfer",
         "description": "Make a verified Home Assistant backup and reserve a maintenance window for two full Core restarts. Keep the device-side cutoff engaged. This request is not confirmation that migration completed or that the equipment is physically off.",
         "data": {"confirm_device_cutoff": "I have a verified backup and independently confirmed the cutoff and safe physical state"}
+      },
+      "common_parameters": {
+        "title": "Common parameter defaults",
+        "description": "These defaults affect all tanks that use common settings, on every card. Thresholds currently provide read-only previews, not automatic control. Save explicitly; cancelling does not write.",
+        "data": {
+          "refill_enabled": "Set common refill thresholds",
+          "refill_lower_m": "Refill lower threshold (m)",
+          "refill_upper_m": "Refill upper threshold (m)",
+          "alarm_enabled": "Set common low-level alarm parameters",
+          "alarm_lower_m": "Low-level alarm threshold (m)",
+          "alarm_delay_seconds": "Low-level alarm delay (seconds)"
+        }
+      },
+      "save_parameters": {
+        "title": "Tank parameters",
+        "description": "Changes affect every card displaying this tank. Use common settings or retain independent local pairs. Thresholds currently provide read-only previews, not automatic control. Save explicitly; cancelling does not write.",
+        "data": {
+          "refill_use_common": "Use common refill thresholds",
+          "refill_enabled": "Keep local refill thresholds",
+          "refill_lower_m": "Local refill lower threshold (m)",
+          "refill_upper_m": "Local refill upper threshold (m)",
+          "alarm_use_common": "Use common low-level alarm parameters",
+          "alarm_enabled": "Keep local low-level alarm parameters",
+          "alarm_lower_m": "Local low-level alarm threshold (m)",
+          "alarm_delay_seconds": "Local low-level alarm delay (seconds)",
+          "scale_enabled": "Set a liquid-level graph scale",
+          "scale_max_m": "Liquid-level graph maximum (m)"
+        }
       },
       "add_zone": {
         "title": "Add a zone and its first tank",
@@ -97,6 +130,7 @@
       "invalid_switch": "Select a switch entity or leave this field empty.",
       "own_level_sensor": "Choose a source sensor, not a level sensor created by this integration.",
       "confirm_required": "Turn on the confirmation to remove this selection.",
+      "invalid_parameters": "Enter complete valid pairs: refill lower must be below upper, alarm delay must be a whole number from 1 to 2147483647, and graph scale must be positive. Common settings must exist before a tank can use them.",
       "one_manual_tank": "Decommission the other tank before commissioning this tank.",
       "cutoff_required": "Verify the exclusive physical mapping and independent device cutoff before enabling control.",
       "registered_output_required": "Select an enabled, registered switch. Known virtual or grouped switches cannot be used.",

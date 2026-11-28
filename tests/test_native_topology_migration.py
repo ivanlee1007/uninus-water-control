@@ -43,8 +43,14 @@ def signals(hass, calls):
 async def disk_row(path, entry_id, predicate=lambda row: True):
     async with asyncio.timeout(14):
         while True:
-            if path.exists():
-                for row in json.loads(path.read_bytes())['data']['entries']:
+            try:
+                payload = path.read_bytes()
+            except (FileNotFoundError, PermissionError):
+                # A native atomic replacement can briefly deny a Windows read.
+                # Keep the existing deadline and require a real valid row.
+                pass
+            else:
+                for row in json.loads(payload)['data']['entries']:
                     if row['entry_id'] == entry_id and predicate(row):
                         return row
             await asyncio.sleep(.05)

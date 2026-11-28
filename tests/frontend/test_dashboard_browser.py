@@ -131,7 +131,7 @@ def test_native_card_contract_and_container_geometry(browser_page):
             assert geometry["tiles"][columns]["y"] >= first["y"] + first["height"]
         evidence.append(geometry)
 
-    for width, columns in ((300, 1), (344, 1), (512, 2), (692, 3)):
+    for width, columns in ((300, 1), (344, 2), (512, 3), (692, 4)):
         measure(width, columns)
         if evidence_dir and width in (300, 692):
             page.locator("#area").screenshot(path=Path(evidence_dir) / f"shell-light-{width}.png")
@@ -139,8 +139,8 @@ def test_native_card_contract_and_container_geometry(browser_page):
         card.hass = {...snapshot({...states, 'sensor.p6': projection(6, 2, 0)}), themes: {darkMode: true}};
     }""")
     page.locator(".tank").nth(5).wait_for()
-    measure(690, 3)
-    measure(740, 3, 1)
+    measure(690, 4)
+    measure(740, 2, 2)
     if evidence_dir:
         directory = Path(evidence_dir)
         page.locator("#area").screenshot(path=directory / "shell-dark-740.png")
@@ -177,7 +177,7 @@ def test_overview_summarizes_per_tank_previews_without_inventing_scale_or_output
     assert first.get_by_text("未設定水位量程", exact=True).is_visible()
     page.get_by_role("button", name="補水參數", exact=True).click()
     assert page.get_by_role("link").count() == 0
-    assert "編輯儀表板 → 編輯補水卡片" in page.get_by_role("region", name="補水參數").inner_text()
+    assert "快捷參數" in page.get_by_role("region", name="補水參數").inner_text()
     assert page.locator("input,select").count() == 0
     page.evaluate("""() => {
         states['binary_sensor.low'] = {...states['binary_sensor.low'], state: 'off'};
@@ -200,7 +200,7 @@ def test_reference_inventory_fits_three_tanks_per_zone_at_desktop_width(browser_
         document.querySelector('#area').append(card);
     }""")
     page.locator(".tank").last.wait_for()
-    for width, expected in ((984, 4), (1030, 4), (1060, 4), (390, 1)):
+    for width, expected in ((984, 3), (1030, 3), (1060, 3), (390, 2)):
         rows = page.evaluate("""width => {
             document.querySelector('#area').style.width = `${width}px`;
             return [...card.shadowRoot.querySelectorAll('.zone')].map(zone => {
@@ -486,7 +486,7 @@ def test_duplicate_labels_keep_distinct_tiles_through_resize_and_availability(br
     }""")
     assert page.evaluate("card.shadowRoot.activeElement === middleButton")
     page.evaluate("""() => {
-        document.querySelector('#area').style.width = '740px';
+        document.querySelector('#area').style.width = '620px';
         const next = {...states, 'sensor.renamed': {...states['sensor.p2'], state: '24'}};
         delete next['sensor.p2'];
         card.hass = snapshot(next);
@@ -701,7 +701,7 @@ def test_approved_console_has_chinese_tabs_and_two_truthful_action_slots(browser
     assert tank.get_by_role("button", name="手動補水", exact=True).is_disabled()
     assert tank.get_by_role("button", name="開啟告警", exact=True).is_disabled()
     assert tank.get_by_text("補水輸出：未提供", exact=True).is_visible()
-    toggle = tank.get_by_role("button", name="詳細狀態", exact=True)
+    toggle = tank.locator(".diagnostics-toggle")
     assert toggle.get_attribute("aria-expanded") == "false"
     assert toggle.evaluate("b => b.parentElement.tagName === 'HEADER'")
     initial_height = tank.bounding_box()["height"]
@@ -937,20 +937,25 @@ def test_display_mode_config_selects_thin_or_dense_rendering(browser_page):
     page = browser_page
     page.evaluate("""() => {
         window.states = Object.fromEntries([1, 2].map(n => [`sensor.p${n}`, projection(n)]));
+        for (const [id, s] of Object.entries(states)) {
+            s.entity_id = id;
+            s.attributes.uninus_water_display = { version: 1, scale_max_m: 2.5 };
+        }
         window.card = normalCard();
         card.setConfig(card.constructor.getStubConfig());
         card.hass = snapshot(states);
         document.querySelector('#area').append(card);
     }""")
     assert page.evaluate("card.dataset.mode") == "thin"
-    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.thresholds')).display") != "none"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.vessel')).display") != "none"
     page.evaluate("card.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'dense'})")
     assert page.evaluate("card.dataset.mode") == "dense"
-    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.thresholds')).display") == "none"
     assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.vessel')).display") == "none"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.info')).display") == "none"
     assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.commands')).display") == "flex"
     page.evaluate("card.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'thin'})")
     assert page.evaluate("card.dataset.mode") == "thin"
+    assert page.evaluate("getComputedStyle(card.shadowRoot.querySelector('.vessel')).display") != "none"
     # Invalid values fall back to thin, never to a broken default.
     page.evaluate("card.setConfig({type: 'custom:uninus-water-dashboard', display_mode: 'weird'})")
     assert page.evaluate("card.dataset.mode") == "thin"
@@ -967,7 +972,8 @@ def test_editor_display_mode_select_emits_card_config(browser_page):
     }""")
     page.evaluate("document.getElementById('area').remove(); editor.shadowRoot.querySelector('select[data-mode-field=\"display_mode\"]').value = 'dense'")
     page.evaluate("editor.shadowRoot.querySelector('select[data-mode-field=\"display_mode\"]').dispatchEvent(new Event('change', { bubbles: true }))")
-    assert page.evaluate("events[0]") == {"type": "custom:uninus-water-dashboard", "display_mode": "dense"}
+    assert page.evaluate("events[0]") == {"type": "custom:uninus-water-dashboard", "display_mode": "dense",
+        "show_details": False, "zone_ids": [], "tank_ids": []}
     # Re-selecting the current mode emits nothing.
     page.evaluate("editor.shadowRoot.querySelector('select[data-mode-field=\"display_mode\"]').dispatchEvent(new Event('change', { bubbles: true }))")
     assert page.evaluate("events.length") == 1
