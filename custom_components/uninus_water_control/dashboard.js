@@ -98,19 +98,41 @@ const STYLE = `
   .tank { background:var(--tint); border:1px solid var(--line); border-radius:10px; padding:8px; min-width:0; }
   .tank .flex { gap:4px; }
   h2,h3,.settings-row,.diagnostics,.manual-dialog { overflow-wrap:anywhere; }
-  .readout { justify-content:flex-start; flex-wrap:nowrap; margin:7px 0; }
+  .readout { justify-content:flex-start; flex-wrap:nowrap; align-items:center; gap:9px; margin:9px 0; }
   .level {
     flex:1; display:block; min-width:0; text-align:start; padding:0;
     min-height:44px; border:0; border-radius:5px; background:transparent;
   }
   .level:hover .value { text-decoration:underline; }
-  .vessel { display:grid; align-items:end; overflow:hidden; width:25px; height:34px; flex:none;
-    border:1px solid #6191ac; border-radius:5px; background:var(--accent-bg); }
-  .water { width:100%; background:#328fc6; }
+  .vessel { position:relative; display:grid; align-items:end; overflow:hidden; width:40px; height:82px; flex:none;
+    border:1px solid #6191ac; border-radius:7px; background:var(--accent-bg); }
+  .vessel::after { content:''; position:absolute; inset:0;
+    background:repeating-linear-gradient(0deg, transparent 0 12px, rgba(255,255,255,.4) 12px 13px);
+    mix-blend-mode:overlay; pointer-events:none; }
+  .water { width:100%; background:linear-gradient(180deg,#3ab5f7,#0484c4); transition:height .6s cubic-bezier(.2,.7,.3,1); }
   .reading { min-width:0; font-size:23px; font-weight:850; letter-spacing:-.045em; line-height:1.1; }
   .value { overflow-wrap:anywhere; }
   .reading small { font-size:12px; letter-spacing:0; font-weight:700; color:var(--muted); margin-left:2px; }
   .relation { display:block; font-weight:600; letter-spacing:0; margin-top:3px; overflow-wrap:anywhere; }
+  .relation[data-tone="alarm"] { color:var(--high); font-weight:800; }
+  .relation[data-tone="limit"] { color:var(--low); }
+  .relation[data-tone="unknown"] { color:var(--wait); }
+  .tank[data-low-level-active] { border-color:color-mix(in srgb, var(--high) 55%, transparent);
+    background:color-mix(in srgb, var(--high-bg) 55%, var(--tint)); }
+  .dropicon { width:30px; height:30px; border-radius:50%; display:grid; place-items:center; flex:none;
+    background:var(--accent-bg); color:var(--accent); }
+  .dropicon svg { width:16px; height:16px; }
+  .tank .flex { align-items:center; }
+  .thresholds { display:grid; gap:3px; padding:7px 9px; border-radius:8px; margin-bottom:6px;
+    background:var(--bg); border:1px solid var(--line); font-size:11px; line-height:1.35; color:var(--muted); }
+  .thresholds .line { display:flex; justify-content:space-between; gap:8px; }
+  .thresholds .key { letter-spacing:.04em; text-transform:uppercase; font-size:.62rem; color:var(--muted); flex:none; }
+  .thresholds .value { font-variant-numeric:tabular-nums; color:var(--ink); font-weight:600; overflow-wrap:anywhere; }
+  .thresholds .line[hidden] { display:none; }
+  .global-pill { font-size:.78rem; font-weight:750; padding:5px 12px; border-radius:999px;
+    background:var(--good-bg); color:var(--good); margin-left:auto; }
+  .global-pill[data-state="alarm"] { background:var(--high-bg); color:var(--high); }
+  .global-pill[data-state="running"] { background:var(--accent-bg); color:var(--accent); }
   .info { display:grid; align-content:start; min-height:34px; line-height:1.25; font-size:12px; margin-bottom:6px; gap:2px; }
   .commands { display:grid; gap:4px; }
   .commands button { width:100%; padding-inline:4px; }
@@ -157,9 +179,16 @@ const STYLE = `
   .shell[data-mode="dense"] .diagnostics { flex-basis:100%; }
   .shell[data-mode="dense"] .range-warning { flex-basis:100%; }
   .shell[data-mode="dense"] .pill { font-size:.66rem; padding:2px 8px; }
+  .shell[data-mode="dense"] .dropicon { display:none; }
+  .shell[data-mode="dense"] .thresholds { display:none; }
+  .shell[data-mode="dense"] .global-pill { font-size:.66rem; padding:2px 8px; }
+  .shell[data-mode="dense"] .readout { align-items:center; }
 
   @container water-console (max-width:480px) {
     button { font-size:13px; }
+    .vessel { width:32px; height:66px; }
+    .reading { font-size:19px; }
+    .thresholds { font-size:10px; padding:6px 8px; }
     .policy { gap:5px 10px; }
     .tank .pill { font-size:11px; }
     .tank h3 { font-size:14px; }
@@ -474,6 +503,9 @@ class UninusWaterDashboard extends HTMLElement {
   #layout;
   #notice;
   #overview;
+  #global;
+  #globalAlarmCount = 0;
+  #globalRunningCount = 0;
   #shell;
   #views = new Map();
   #view = "overview";
@@ -504,9 +536,12 @@ class UninusWaterDashboard extends HTMLElement {
     const count = element("p", "dim");
     text(title, "補水控制");
     heading.append(title, count);
+    const globalPill = element("span", "global-pill");
+    globalPill.dataset.state = "normal";
+    globalPill.hidden = true;
     const nav = element("nav", "tabs");
     nav.setAttribute("aria-label", "補水頁面");
-    head.append(heading, nav);
+    head.append(heading, globalPill, nav);
     this.#shell.append(head);
     for (const [key, name] of Object.entries(VIEWS)) {
       const tab = button();
@@ -531,6 +566,7 @@ class UninusWaterDashboard extends HTMLElement {
     summary.append(refill, separator, alarm);
     this.#views.get("overview").section.append(summary, this.#notice, this.#layout);
     this.#overview = { count, summary, refill, alarm };
+    this.#global = globalPill;
     for (const [key, titleText, linkText, help] of [
       ["parameters", "各桶門檻與顯示量程", null,
         "此處僅顯示已套用的參數。管理員可在正常操作總覽開啟每桶的「快捷參數」調整；共用預設、設備與安全設定請使用原生整合設定。門檻預覽不操作設備。"],
@@ -1096,9 +1132,11 @@ class UninusWaterDashboard extends HTMLElement {
     const host = element("article", "tank");
     host.dataset.tankId = tank.id;
     const header = element("header", "flex");
+    const dropicon = element("span", "dropicon");
+    dropicon.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>';
     const title = element("h3");
     const pill = button("pill diagnostics-toggle");
-    header.append(title, pill);
+    header.append(dropicon, title, pill);
     const measurement = element("div", "readout");
     const readout = button("level");
     const vessel = element("span", "vessel");
@@ -1115,6 +1153,21 @@ class UninusWaterDashboard extends HTMLElement {
     readout.append(reading);
     measurement.append(vessel, readout);
     const rangeMessage = element("p", "dim range-warning");
+    const thresholds = element("div", "thresholds");
+    const thresholdRefill = element("div", "line");
+    const thresholdAlarm = element("div", "line");
+    function lineOf(node, keyText) {
+      const key = element("span", "key");
+      text(key, keyText);
+      const value = element("span", "value");
+      node.append(key, value);
+      thresholds.append(node);
+      return value;
+    }
+    const thresholdsValues = {
+      refill: lineOf(thresholdRefill, "補水門檻"),
+      alarm: lineOf(thresholdAlarm, "低告警"),
+    };
     const info = element("div", "info");
     const commands = element("div", "commands");
     const quick = button("quick-parameters");
@@ -1137,10 +1190,11 @@ class UninusWaterDashboard extends HTMLElement {
       node.addEventListener("click", () => moreInfo(node, node.dataset.entity));
       return [kind, node];
     }));
-    host.append(header, measurement, rangeMessage, info, commands, quick, diagnostics);
+    host.append(header, measurement, rangeMessage, thresholds, info, commands, quick, diagnostics);
     diagnostics.hidden = !this.#config.show_details;
     pill.setAttribute("aria-expanded", String(!diagnostics.hidden));
-    const slot = { host, title, pill, readout, vessel, water, value, unit, relation, range, rangeMessage, previewRows, quick };
+    const slot = { host, title, pill, dropicon, readout, vessel, water, value, unit, relation,
+      range, rangeMessage, thresholdsValues, previewRows, quick };
     readout.addEventListener("click", () => moreInfo(readout, slot.entity));
     const roles = new Map();
     for (const role of ROLES) roles.set(role, this.#newPanel(tank.id, role, slot));
@@ -1203,6 +1257,8 @@ class UninusWaterDashboard extends HTMLElement {
     this.#shell.toggleAttribute("data-dark", this.#hass?.themes?.darkMode === true);
     for (const { link } of this.#views.values()) if (link) link.hidden = this.#hass?.user?.is_admin !== true;
     const zones = this.#displayZones(states ?? {});
+    this.#globalAlarmCount = 0;
+    this.#globalRunningCount = 0;
     if (this.#quick) {
       const target = this.#quickTarget(this.#quick.target.tank_id);
       if (!target || JSON.stringify(target) !== JSON.stringify(this.#quick.target)) this.#closeQuick();
@@ -1259,8 +1315,16 @@ class UninusWaterDashboard extends HTMLElement {
         slot.readout.setAttribute("aria-label", `${tank.name} · ${depth ? `${depth.shown} m` : UNAVAILABLE}`);
         slot.readout.title = "開啟水位詳細資訊";
         updateGauge(slot, depth, display.scale);
-        text(slot.relation, relationText(depth, display, band, low));
-        slot.host.toggleAttribute("data-low-level-active", low === "on");
+        const relationText_ = relationText(depth, display, band, low);
+        slot.relation.textContent = relationText_;
+        slot.relation.dataset.tone = /告警|↓ 達|↓ 低/.test(relationText_) ? "alarm"
+          : /門檻/.test(relationText_) ? "limit"
+          : /不可用|無法取得|未設定/.test(relationText_) ? "unknown" : "normal";
+        text(slot.thresholdsValues.refill, display.refill ? `${display.refill[0]}／${display.refill[1]} m` : "補水門檻未設定");
+        text(slot.thresholdsValues.alarm, display.alarm ? `≤ ${display.alarm[0]} m · ${display.alarm[1]} 秒` : "低液位告警未設定");
+        const alarmOn = low === "on";
+        slot.host.toggleAttribute("data-low-level-active", alarmOn);
+        if (alarmOn) this.#globalAlarmCount += 1;
         for (const [kind, control] of slot.previewRows) {
           const entity = available?.get(kind);
           const isRefill = kind === "refill_preview";
@@ -1290,6 +1354,7 @@ class UninusWaterDashboard extends HTMLElement {
             refill.phase === "idle" && refillPanel.startWait ? "等候回報" : PHASE_LABEL[refill.phase] :
           commissioned ? "回報未知" : "未提供";
         text(slot.pill, pill);
+        if (pill === "補水中") this.#globalRunningCount += 1;
         slot.pill.setAttribute("aria-label", `${pill}：詳細狀態`);
         slot.pill.classList.toggle("good", pill === "補水中");
         slot.pill.classList.toggle("high", refill?.phase === "fault");
@@ -1312,6 +1377,22 @@ class UninusWaterDashboard extends HTMLElement {
     }
     const { count, summary, refill, alarm } = this.#overview;
     text(count, `${zones.length} 區 · ${displays.size} 桶 · 水位單位 m`);
+    const global = this.#global;
+    if (global) {
+      const alarmCount = this.#globalAlarmCount ?? 0;
+      const runningCount = this.#globalRunningCount ?? 0;
+      if (alarmCount > 0) {
+        text(global, `告警中 ${alarmCount} 桶`);
+        global.dataset.state = "alarm";
+      } else if (runningCount > 0) {
+        text(global, `運轉中 ${runningCount} 桶`);
+        global.dataset.state = "running";
+      } else {
+        text(global, "全部正常");
+        global.dataset.state = "normal";
+      }
+      global.hidden = !zones.length;
+    }
     const all = [...displays.values()];
     const waterPolicy = uniformPair(all, "refill");
     const alarmPolicy = uniformPair(all, "alarm");
