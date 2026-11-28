@@ -860,7 +860,8 @@ async def verify_native_editor(hass, entry, outputs, url, screenshots):
                     yaml_saved = await page.evaluate(SETTINGS_CALL, {"type": "lovelace/config"})
                     expected_yaml = deepcopy(yaml_before)
                     expected_yaml["views"][0]["cards"][0] = {"type": f"custom:{CARD_TAG}", "show_details": True,
-                        "zone_ids": [selected_zone["id"]], "tank_ids": [tank_id], "grid_options": {"columns": columns}}
+                        "zone_ids": [selected_zone["id"]], "tank_ids": [tank_id], "grid_options": {"columns": columns},
+                        "display_mode": "thin"}
                     assert yaml_saved == expected_yaml, (yaml_saved, expected_yaml)
                     modal, display = await open_card_editor(page, card_edit)
                     await expect(display.get_by_role("checkbox", name=selected_zone["name"], exact=True)).to_be_checked()
